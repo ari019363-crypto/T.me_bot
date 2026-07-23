@@ -11,7 +11,7 @@ from telebot.types import ChatPermissions
 # ================= ================= =================
 # تنظیمات اولیه ربات و متغیرهای محیطی Railway
 # ================= ================= =================
-TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAFv2XHBLW695nET_eCqu3Bj42jxdAJYc74")
+TOKEN = os.environ.get("BOT_TOKEN")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "GapYar128_bot")
 
 # آیدی عددی مالکان اصلی ربات (سودو ادمین‌ها)
@@ -414,6 +414,7 @@ def show_words_list(chat_id, user_id):
 @bot.message_handler(
     func=lambda msg: msg.chat.type == "private"
     and msg.from_user.id in user_states
+    and user_states[msg.from_user.id].get("step") in ["wait_word", "wait_response", "wait_delete_code"]
 )
 def process_private_inputs(message):
     user_id = message.from_user.id
@@ -1408,8 +1409,16 @@ def handle_warn_callback_buttons(call):
 
 
 # ================= ================= =================
-# اجرای ربات
+# اجرای ربات (با پاک‌سازی اتصالات قبلی جهت رفع ارور 409)
 # ================= ================= =================
 if __name__ == "__main__":
     print("Bot Umbrella (Full Final Version) is running...")
+    
+    # پاک‌سازی اتصالات و وب‌هوک‌های قبلی
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
+
+    # شروع پردازش پیام‌ها
     bot.infinity_polling(skip_pending=True)
