@@ -2,20 +2,44 @@ import os
 import random
 import re
 import sqlite3
+import time
 import telebot
 from telebot import types
+from telebot.types import ChatPermissions
 
 # ================= ================= =================
-# تنظیمات اولیه ربات
+# تنظیمات اولیه ربات و متغیرهای محیطی Railway
 # ================= ================= =================
-TOKEN = "8793539029:AAH8TpvVRJ7erwQyswP26I3C7q7V4PRuSvg"  # توکن ربات خود را اینجا بگذارید
-BOT_USERNAME = "GapYar128_bot"  # یوزرنیم ربات بدون @
+TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAH8TpvVRJ7erwQyswP26I3C7q7V4PRuSvg")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "GapYar128_bot")
 
 # آیدی عددی مالکان اصلی ربات (سودو ادمین‌ها)
-SUDO_ADMINS = [7430881772,8632617239]
+sudo_raw = os.environ.get("SUDO_ADMINS", "7430881772,8632617239")
+SUDO_ADMINS = [
+    int(x.strip()) for x in sudo_raw.split(",") if x.strip().isdigit()
+]
 
 bot = telebot.TeleBot(TOKEN)
 user_states = {}  # مدیریت وضعیت ورودی‌های کاربران
+
+# ================= ================= =================
+# مجوزهای سکوت و لغو سکوت (Mute / Unmute)
+# ================= ================= =================
+MUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_media_messages=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+
+UNMUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_media_messages=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_send_polls=True,
+    can_invite_users=True,
+)
 
 
 # ================= ================= =================
@@ -41,6 +65,16 @@ def init_db():
             chat_id INTEGER,
             user_id INTEGER,
             count INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+
+  # جدول سطوح مجازات (استریک)
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS strikes (
+            chat_id INTEGER,
+            user_id INTEGER,
+            count INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
@@ -107,8 +141,74 @@ def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
 
 
 # ================= ================= =================
-# توابع کمکی
+# توابع کمکی و مجازات پلکانی
 # ================= ================= =================
+def convert_fa_numbers(text: str) -> str:
+  """تبدیل اعداد فارسی و عربی به انگلیسی"""
+  fa_digits = "۰۱۲۳۴۵۶۷۸۹"
+  ar_digits = "٠١٢٣٤٥٦٧٨٩"
+  en_digits = "0123456789"
+  for f, a, e in zip(fa_digits, ar_digits, en_digits):
+    text = text.replace(f, e).replace(a, e)
+  return text
+
+
+def apply_progressive_punishment(chat_id, user_id):
+  """اعمال مجازات پلکانی بر اساس تعداد دفعات ۳ اخطاره شدن (استریک)"""
+  strike_row = db_query(
+      "SELECT count FROM strikes WHERE chat_id = ? AND user_id = ?",
+      (chat_id, user_id),
+      fetchone=True,
+  )
+  current_strikes = (strike_row[0] + 1) if strike_row else 1
+
+  # افزایش سطح استریک و صفر کردن اخطارهای خرد
+  db_query(
+      "INSERT OR REPLACE INTO strikes (chat_id, user_id, count) VALUES (?, ?,"
+      " ?)",
+      (chat_id, user_id, current_strikes),
+      commit=True,
+  )
+  db_query(
+      "UPDATE warnings SET count = 0 WHERE chat_id = ? AND user_id = ?",
+      (chat_id, user_id),
+      commit=True,
+  )
+
+  now = int(time.time())
+
+  if current_strikes == 1:
+    until = now + 3600  # ۱ ساعت
+    bot.restrict_chat_member(
+        chat_id, user_id, until_date=until, permissions=MUTE_PERMISSIONS
+    )
+    return (
+        f"⏳ کاربر به دلیل دریافت ۳ اخطار، **۱ ساعت** سکوت شد. (سطح جریمه:"
+        f" {current_strikes})"
+    )
+  elif current_strikes == 2:
+    until = now + (12 * 3600)  # ۱۲ ساعت
+    bot.restrict_chat_member(
+        chat_id, user_id, until_date=until, permissions=MUTE_PERMISSIONS
+    )
+    return (
+        f"⏳ کاربر به دلیل تکرار تخلف (بار دوم)، **۱۲ ساعت** سکوت شد. (سطح"
+        f" جریمه: {current_strikes})"
+    )
+  elif current_strikes == 3:
+    until = now + (24 * 3600)  # ۲۴ ساعت
+    bot.restrict_chat_member(
+        chat_id, user_id, until_date=until, permissions=MUTE_PERMISSIONS
+    )
+    return (
+        f"⏳ کاربر به دلیل تکرار تخلف (بار سوم)، **۲۴ ساعت** سکوت شد. (سطح"
+        f" جریمه: {current_strikes})"
+    )
+  else:
+    bot.ban_chat_member(chat_id, user_id)
+    return "🚫 کاربر به دلیل بی‌توجهی به اخطارها (بار چهارم)، از گروه **اخراج (Ban)** شد!"
+
+
 def is_admin(chat_id, user_id):
   if user_id in SUDO_ADMINS:
     return True
@@ -132,15 +232,13 @@ def get_group_owner_id(chat_id):
 
 def get_settings(chat_id):
   row = db_query(
-      "SELECT anti_forward, anti_link, anti_spam, anti_bot FROM"
-      " group_settings WHERE chat_id = ?",
+      "SELECT anti_forward, anti_link, anti_spam, anti_bot FROM group_settings WHERE chat_id = ?",
       (chat_id,),
       fetchone=True,
   )
   if not row:
     db_query(
-        "INSERT INTO group_settings (chat_id, anti_forward, anti_link,"
-        " anti_spam, anti_bot) VALUES (?, 0, 0, 0, 0)",
+        "INSERT INTO group_settings (chat_id, anti_forward, anti_link, anti_spam, anti_bot) VALUES (?, 0, 0, 0, 0)",
         (chat_id,),
         commit=True,
     )
@@ -248,15 +346,19 @@ def handle_private_callbacks(call):
         "• با دکمه «یاد دادن کلمه» در پیوی، کلمات دلخواهتان را ذخیره کنید.\n"
         "• ربات در هر گروهی که **مالک (Creator)** آن باشید، از لیست کلمات"
         " اختصاصی شما پاسخ می‌دهد.\n\n"
-        "⚙️ **۲. دستورات مدیریتی گروه (مخصوص مدیران):**\n"
-        "• `/panel` : باز کردن پنل تنظیمات و قفل گروه\n"
-        "• `/warn` : ثبت اخطار دستی (روی پیام کاربر ریپلای کنید)\n"
-        "• `/unwarn` : حذف اخطار کاربر (روی پیام کاربر ریپلای کنید)\n"
-        "• `/title [لقب]` : دادن لقب به عضو (روی پیام ریپلای کنید)\n"
-        "• `/vip` : اضافه کردن کاربر به لیست اعضای ویژه (معاف از قفل‌ها)\n"
-        "• `/unvip` : لغو وضعیت ویژه کاربر\n\n"
+        "⚙️ **۲. دستورات فارسی و انگلیسی گروه (مخصوص مدیران با ریپلای):**\n"
+        "• `اخطار` یا `/warn` : ثبت اخطار (با رسیدن به ۳، جریمه پلکانی ۱س/۱۲س/۲۴س/بن"
+        " اعمال می‌شود)\n"
+        "• `حذف اخطار` یا `/unwarn` : پاک کردن ۱ اخطار کاربر\n"
+        "• `صفر کردن` : پاکسازی کامل اخطارها و سطح جریمه کاربر\n"
+        "• `سکوت 10` : سکوت زمان‌دار کاربر به دقیقه دلخواه\n"
+        "• `رفع سکوت` : لغو وضعیت سکوت کاربر\n"
+        "• `بن` : اخراج کاربر از گروه\n"
+        "• `/title [لقب]` : دادن لقب به عضو\n"
+        "• `/vip` و `/unvip` : مدیریت اعضای ویژه\n"
+        "• `/panel` : باز کردن پنل تنظیمات گروه\n\n"
         "📦 **۳. سیستم بکاپ و بازیابی کل حافظه (مالک ربات):**\n"
-        "• `/backup` : دریافت فایل کامل دیتابیس شامل کل داده‌ها\n"
+        "• `/backup` : دریافت فایل کامل دیتابیس\n"
         "• `/restore` : بازیابی کامل اطلاعات با ریپلای روی فایل `.db`"
     )
     bot.send_message(chat_id, help_text, parse_mode="Markdown")
@@ -279,9 +381,7 @@ def show_words_list(chat_id, user_id):
     )
     res_list = [r[0] for r in responses_rows]
     res_str = " / ".join(res_list)
-    text += (
-        f"کد:{idx}\nکلمه: {w}\nجواب: {res_str}\n------------------\n"
-    )
+    text += f"کد:{idx}\nکلمه: {w}\nجواب: {res_str}\n------------------\n"
 
   markup = types.InlineKeyboardMarkup(row_width=2)
   btn_add = types.InlineKeyboardButton(
@@ -333,8 +433,7 @@ def process_private_inputs(message):
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
             types.InlineKeyboardButton(
-                "🗑️ حذف خود کلمه (کل جواب‌ها)",
-                callback_data=f"del_all_{code}",
+                "🗑️ حذف خود کلمه (کل جواب‌ها)", callback_data=f"del_all_{code}"
             ),
             types.InlineKeyboardButton(
                 "💬 حذف یک جواب خاص", callback_data=f"del_resp_pick_{code}"
@@ -382,8 +481,8 @@ def handle_deletion_flow(call):
       )
       bot.send_message(
           chat_id,
-          f"آیا مطمئنی می‌خواهی کلمه **{target_word}** و تمامی پاسخ‌های آن را"
-          " حذف کنی؟",
+          f"آیا مطمئنی می‌خواهی کلمه **{target_word}** و تمامی پاسخ‌های آن را حذف"
+          " کنی؟",
           parse_mode="Markdown",
           reply_markup=markup,
       )
@@ -411,8 +510,7 @@ def handle_deletion_flow(call):
     if code <= len(words):
       target_word = words[code - 1]
       responses = db_query(
-          "SELECT id, response FROM learned_words WHERE user_id = ? AND word ="
-          " ?",
+          "SELECT id, response FROM learned_words WHERE user_id = ? AND word = ?",
           (user_id, target_word),
           fetchall=True,
       )
@@ -572,15 +670,15 @@ def handle_panel_and_settings(call):
   elif data == "panel_warn_info":
     bot.send_message(
         chat_id,
-        "⚠️ برای ثبت اخطار دستی، روی پیام کاربر ریپلای کنید و عبارت `/warn` را"
-        " بفرستید.",
+        "⚠️ برای ثبت اخطار دستی، روی پیام کاربر ریپلای کنید و عبارت `اخطار` یا"
+        " `/warn` را بفرستید.",
     )
 
   elif data == "panel_unwarn_info":
     bot.send_message(
         chat_id,
-        "🟢 برای حذف اخطار کاربر، روی پیام او ریپلای کنید و عبارت `/unwarn` را"
-        " بفرستید.",
+        "🟢 برای حذف اخطار کاربر، روی پیام او ریپلای کنید و عبارت `حذف اخطار` یا"
+        " `/unwarn` را بفرستید.",
     )
 
   elif data == "panel_banned_menu":
@@ -735,9 +833,7 @@ def handle_purge_actions(call):
 
   if call.data == "purge_custom":
     user_states[user_id] = {"step": "wait_purge_num", "chat_id": chat_id}
-    bot.send_message(
-        chat_id, "می‌خوای چندتا پیام پاک بشه؟ (یک عدد وارد کن):"
-    )
+    bot.send_message(chat_id, "می‌خوای چندتا پیام پاک بشه؟ (یک عدد وارد کن):")
 
   elif call.data == "purge_all":
     start_id = call.message.message_id
@@ -748,9 +844,7 @@ def handle_purge_actions(call):
         deleted += 1
       except Exception:
         pass
-    bot.send_message(
-        chat_id, f"💥 تعداد {deleted} پیام با موفقیت پاکسازی شد."
-    )
+    bot.send_message(chat_id, f"💥 تعداد {deleted} پیام با موفقیت پاکسازی شد.")
 
 
 @bot.message_handler(
@@ -778,49 +872,82 @@ def process_purge_number(message):
 
 
 # ================= ================= =================
-# 4. دستورات ادمین بر اساس ریپلای (/warn, /title, /vip)
+# 4. پردازش دستورات فارسی و انگلیسی ادمین (با ریپلای)
 # ================= ================= =================
 @bot.message_handler(
-    commands=["warn", "unwarn", "title", "vip", "unvip"],
-    chat_types=["group", "supergroup"],
+    func=lambda msg: msg.chat.type in ["group", "supergroup"]
+    and msg.reply_to_message is not None
 )
-def handle_reply_commands(message):
+def handle_persian_and_english_reply_commands(message):
   chat_id = message.chat.id
   user_id = message.from_user.id
 
   if not is_admin(chat_id, user_id):
     return
 
-  if not message.reply_to_message:
-    bot.reply_to(
-        message, "❌ لطفاً این دستور را روی پیام کاربر مورد نظر ریپلای کنید!"
-    )
-    return
-
+  raw_text = message.text or ""
+  text = convert_fa_numbers(raw_text.strip().lower())
   target_user = message.reply_to_message.from_user
-  cmd = message.text.split()[0].lower()
 
-  if cmd == "/warn":
+  # جلوگیری از اعمال دستور روی ادمین‌ها یا ربات
+  if is_admin(chat_id, target_user.id) or target_user.is_bot:
+    if (
+        text
+        in [
+            "اخطار",
+            "بن",
+            "صفر کردن",
+            "پاکسازی اخطار",
+            "بخشش",
+            "حذف اخطار",
+            "کم کردن اخطار",
+            "رفع سکوت",
+            "آزاد",
+            "ازاد",
+        ]
+        or text.startswith("سکوت")
+        or text.startswith(("/warn", "/unwarn", "/vip", "/unvip"))
+    ):
+      bot.reply_to(
+          message,
+          "❌ امکان اعمال دستورات مدیریتی روی ادمین‌ها یا ربات‌ها وجود ندارد.",
+      )
+      return
+
+  # ۱. دستور اخطار (فارسی و انگلیسی)
+  if text in ["اخطار", "/warn"]:
     warn_data = db_query(
         "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
         (chat_id, target_user.id),
         fetchone=True,
     )
     current = (warn_data[0] + 1) if warn_data else 1
-    db_query(
-        "INSERT OR REPLACE INTO warnings (chat_id, user_id, count) VALUES (?, ?,"
-        " ?)",
-        (chat_id, target_user.id, current),
-        commit=True,
-    )
-    bot.reply_to(
-        message,
-        f"⚠️ یک اخطار به [{target_user.first_name}](tg://user?id={target_user.id})"
-        f" داده شد.\nتعداد اخطارها: {current} از 3",
-        parse_mode="Markdown",
-    )
 
-  elif cmd == "/unwarn":
+    if current >= 3:
+      punish_msg = apply_progressive_punishment(chat_id, target_user.id)
+      bot.reply_to(
+          message,
+          f"⚠️ کاربر [{target_user.first_name}](tg://user?id={target_user.id})"
+          f" به ۳ اخطار رسید!\n\n{punish_msg}",
+          parse_mode="Markdown",
+      )
+    else:
+      db_query(
+          "INSERT OR REPLACE INTO warnings (chat_id, user_id, count) VALUES"
+          " (?, ?, ?)",
+          (chat_id, target_user.id, current),
+          commit=True,
+      )
+      bot.reply_to(
+          message,
+          f"⚠️ یک اخطار به"
+          f" [{target_user.first_name}](tg://user?id={target_user.id}) داده"
+          f" شد.\nتعداد اخطارها: **{current}/3**",
+          parse_mode="Markdown",
+      )
+
+  # ۲. دستور حذف اخطار (فارسی و انگلیسی)
+  elif text in ["حذف اخطار", "کم کردن اخطار", "/unwarn"]:
     warn_data = db_query(
         "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
         (chat_id, target_user.id),
@@ -837,13 +964,89 @@ def handle_reply_commands(message):
           message,
           "🟢 یک اخطار از"
           f" [{target_user.first_name}](tg://user?id={target_user.id}) کسر"
-          f" شد. اخطارهای باقی‌مانده: {new_count}",
+          f" شد. اخطارهای باقی‌مانده: **{new_count}**",
           parse_mode="Markdown",
       )
     else:
-      bot.reply_to(message, "این کاربر هیچ اخطاری ندارد.")
+      bot.reply_to(
+          message,
+          f"ℹ️ کاربر [{target_user.first_name}](tg://user?id={target_user.id})"
+          " هیچ اخطاری ندارد.",
+          parse_mode="Markdown",
+      )
 
-  elif cmd == "/vip":
+  # ۳. صفر کردن کامل اخطارها و سطح جریمه (استریک)
+  elif text in ["صفر کردن", "پاکسازی اخطار", "بخشش"]:
+    db_query(
+        "UPDATE warnings SET count = 0 WHERE chat_id = ? AND user_id = ?",
+        (chat_id, target_user.id),
+        commit=True,
+    )
+    db_query(
+        "UPDATE strikes SET count = 0 WHERE chat_id = ? AND user_id = ?",
+        (chat_id, target_user.id),
+        commit=True,
+    )
+    bot.reply_to(
+        message,
+        "🔄 تمامی اخطارها و سطح جریمه کاربر"
+        f" [{target_user.first_name}](tg://user?id={target_user.id}) صفر شد.",
+        parse_mode="Markdown",
+    )
+
+  # ۴. رفع سکوت (Unmute)
+  elif text in ["رفع سکوت", "حذف سکوت", "ازاد", "آزاد"]:
+    try:
+      bot.restrict_chat_member(
+          chat_id, target_user.id, permissions=UNMUTE_PERMISSIONS
+      )
+      bot.reply_to(
+          message,
+          "🔊 وضعیت سکوت کاربر"
+          f" [{target_user.first_name}](tg://user?id={target_user.id}) لغو"
+          " شد.",
+          parse_mode="Markdown",
+      )
+    except Exception:
+      bot.reply_to(message, "❌ خطایی در رفع سکوت کاربر رخ داد.")
+
+  # ۵. اخراج کاربر (Ban)
+  elif text in ["بن", "/ban"]:
+    try:
+      bot.ban_chat_member(chat_id, target_user.id)
+      bot.reply_to(
+          message,
+          f"🚫 کاربر [{target_user.first_name}](tg://user?id={target_user.id})"
+          " از گروه اخراج شد.",
+          parse_mode="Markdown",
+      )
+    except Exception:
+      bot.reply_to(message, "❌ خطایی در بن کردن کاربر رخ داد.")
+
+  # ۶. سکوت زمان‌دار (مثلاً: سکوت 10 یا سکوت ۵)
+  elif text.startswith("سکوت"):
+    parts = text.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+      minutes = int(parts[1])
+      until_time = int(time.time()) + (minutes * 60)
+      try:
+        bot.restrict_chat_member(
+            chat_id,
+            target_user.id,
+            until_date=until_time,
+            permissions=MUTE_PERMISSIONS,
+        )
+        bot.reply_to(
+            message,
+            f"🔇 کاربر [{target_user.first_name}](tg://user?id={target_user.id})"
+            f" به مدت **{minutes} دقیقه** سکوت شد.",
+            parse_mode="Markdown",
+        )
+      except Exception:
+        bot.reply_to(message, "❌ خطایی در سکوت کردن کاربر رخ داد.")
+
+  # ۷. عضو ویژه (VIP)
+  elif text in ["/vip", "ویژه"]:
     db_query(
         "INSERT OR REPLACE INTO vip_users (chat_id, user_id) VALUES (?, ?)",
         (chat_id, target_user.id),
@@ -856,7 +1059,8 @@ def handle_reply_commands(message):
         parse_mode="Markdown",
     )
 
-  elif cmd == "/unvip":
+  # ۸. لغو عضو ویژه (UnVIP)
+  elif text in ["/unvip", "حذف ویژه"]:
     db_query(
         "DELETE FROM vip_users WHERE chat_id = ? AND user_id = ?",
         (chat_id, target_user.id),
@@ -869,7 +1073,8 @@ def handle_reply_commands(message):
         parse_mode="Markdown",
     )
 
-  elif cmd == "/title":
+  # ۹. اعطای لقب (/title)
+  elif text.startswith("/title") or text.startswith("لقب"):
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
       title_text = parts[1].strip()
@@ -934,7 +1139,9 @@ def restore_db_backup(message):
 
   doc = message.reply_to_message.document
   if not doc.file_name.endswith(".db"):
-    bot.reply_to(message, "❌ فایل ارسالی باید یک فایل دیتابیس با پسوند `.db` باشد!")
+    bot.reply_to(
+        message, "❌ فایل ارسالی باید یک فایل دیتابیس با پسوند `.db` باشد!"
+    )
     return
 
   try:
@@ -1028,30 +1235,40 @@ def group_messages_processor(message):
       )
       current_warns = (warn_data[0] + 1) if warn_data else 1
 
-      db_query(
-          "INSERT OR REPLACE INTO warnings (chat_id, user_id, count) VALUES"
-          " (?, ?, ?)",
-          (chat_id, user_id, current_warns),
-          commit=True,
-      )
+      if current_warns >= 3:
+        punish_msg = apply_progressive_punishment(chat_id, user_id)
+        bot.send_message(
+            chat_id,
+            f"⚠️ کاربر [{message.from_user.first_name}](tg://user?id={user_id})"
+            " به دلیل استفاده از کلمه ممنوعه به ۳ اخطار رسید!\n\n"
+            f"{punish_msg}",
+            parse_mode="Markdown",
+        )
+      else:
+        db_query(
+            "INSERT OR REPLACE INTO warnings (chat_id, user_id, count) VALUES"
+            " (?, ?, ?)",
+            (chat_id, user_id, current_warns),
+            commit=True,
+        )
 
-      markup = types.InlineKeyboardMarkup(row_width=2)
-      btn_show = types.InlineKeyboardButton(
-          "👁️ مشاهده پیام", callback_data=f"view_msg_{user_id}"
-      )
-      btn_del_warn = types.InlineKeyboardButton(
-          "❌ حذف اخطار", callback_data=f"remove_warn_{user_id}"
-      )
-      markup.add(btn_show, btn_del_warn)
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        btn_show = types.InlineKeyboardButton(
+            "👁️ مشاهده پیام", callback_data=f"view_msg_{user_id}"
+        )
+        btn_del_warn = types.InlineKeyboardButton(
+            "❌ حذف اخطار", callback_data=f"remove_warn_{user_id}"
+        )
+        markup.add(btn_show, btn_del_warn)
 
-      bot.send_message(
-          chat_id,
-          f"کاربر [{message.from_user.first_name}](tg://user?id={user_id}) شما"
-          f" از کلمه ممنوعه استفاده کردید و {current_warns} اخطار از 3 اخطار"
-          " را گرفتید!",
-          parse_mode="Markdown",
-          reply_markup=markup,
-      )
+        bot.send_message(
+            chat_id,
+            f"کاربر [{message.from_user.first_name}](tg://user?id={user_id})"
+            f" شما از کلمه ممنوعه استفاده کردید و {current_warns} اخطار از 3"
+            " اخطار را گرفتید!",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
       return
 
   process_chatbot_response(message)
