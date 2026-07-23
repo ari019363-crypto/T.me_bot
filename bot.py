@@ -11,7 +11,7 @@ from telebot.types import ChatPermissions
 # ================= ================= =================
 # تنظیمات اولیه ربات و متغیرهای محیطی Railway
 # ================= ================= =================
-TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAH8TpvVRJ7erwQyswP26I3C7q7V4PRuSvg")
+TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAFv2XHBLW695nET_eCqu3Bj42jxdAJYc74")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "GapYar128_bot")
 
 # آیدی عددی مالکان اصلی ربات (سودو ادمین‌ها)
