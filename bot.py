@@ -46,6 +46,16 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAGBdIZYPBXCs-DZ_E1ZD3rGsSLO
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatr_bot.db")
 MAX_WARNINGS = 3          # بعد از این تعداد اخطار، کاربر به صورت خودکار از گروه حذف می‌شه
 MESSAGES_TO_KEEP = 2000   # حداکثر تعداد آی‌دی پیام ذخیره شده برای هر گروه (برای قابلیت حذف پیام‌ها)
+MAX_SPAM_MUTE_MINUTES = 30  # حداکثر مجاز برای دقیقه‌ی سکوت خودکار ضد اسپم
+
+# آی‌دی عددی مالک اصلی ربات (تو). هر کسی که آی‌دیش اینجا باشه، تو هر گروهی که ربات عضوشه،
+# فارغ از اینکه واقعا ادمین/مالک همون گروه باشه یا نه، دسترسی کامل ادمین و مالک داره.
+# می‌تونی مستقیم عدد آی‌دیت رو اینجا بنویسی، یا با متغیر محیطی SUPER_ADMIN_IDS (با کاما جدا) ست کنی.
+SUPER_ADMIN_IDS = set()
+_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "7430881772")
+if _env_super_admins:
+    SUPER_ADMIN_IDS |= {int(x.strip()) for x in _env_super_admins.split(",") if x.strip().isdigit()}
+# مثال دستی: SUPER_ADMIN_IDS.add(123456789)
 
 # مراحل مکالمه (ConversationHandler states)
 (
@@ -62,7 +72,10 @@ MESSAGES_TO_KEEP = 2000   # حداکثر تعداد آی‌دی پیام ذخی�
     DELETE_N_WAIT_NUMBER,
     SPECIAL_ADD_WAIT_USER,
     SPECIAL_TONE_WAIT_TEXT,
-) = range(13)
+    DELETE_WORD_WAIT_CODE,
+    SPAM_CFG_WAIT_THRESHOLD,
+    SPAM_CFG_WAIT_MUTE,
+) = range(16)
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +95,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS learned_words (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
+            teacher_id INTEGER NOT NULL DEFAULT 0,
             code INTEGER NOT NULL,
             trigger_word TEXT NOT NULL,
             answers TEXT NOT NULL,      -- JSON list of strings
-            UNIQUE(chat_id, code)
+            UNIQUE(chat_id, teacher_id, code)
         );
 
         CREATE TABLE IF NOT EXISTS admins (
@@ -119,7 +133,13 @@ def init_db():
             chat_id INTEGER PRIMARY KEY,
             locked INTEGER NOT NULL DEFAULT 0,
             forward_allowed INTEGER NOT NULL DEFAULT 1,
-            spam_protection INTEGER NOT NULL DEFAULT 0
+            spam_protection INTEGER NOT NULL DEFAULT 0,
+            spam_threshold INTEGER NOT NULL DEFAULT 5,
+            spam_mute_minutes INTEGER NOT NULL DEFAULT 5,
+            allow_photo INTEGER NOT NULL DEFAULT 1,
+            allow_video INTEGER NOT NULL DEFAULT 1,
+            allow_sticker_gif INTEGER NOT NULL DEFAULT 1,
+            owner_user_id INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS tracked_messages (
@@ -138,6 +158,49 @@ def init_db():
         """
     )
     conn.commit()
+
+    # --- مهاجرت امن برای دیتابیس‌های قدیمی‌تر که این ستون‌ها/محدودیت‌ها رو نداشتن ---
+    def _column_names(table):
+        c.execute(f"PRAGMA table_info({table})")
+        return [r[1] for r in c.fetchall()]
+
+    def _add_column_if_missing(table, coldef):
+        col_name = coldef.split()[0]
+        if col_name not in _column_names(table):
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+            conn.commit()
+
+    for coldef in (
+        "spam_threshold INTEGER NOT NULL DEFAULT 5",
+        "spam_mute_minutes INTEGER NOT NULL DEFAULT 5",
+        "allow_photo INTEGER NOT NULL DEFAULT 1",
+        "allow_video INTEGER NOT NULL DEFAULT 1",
+        "allow_sticker_gif INTEGER NOT NULL DEFAULT 1",
+        "owner_user_id INTEGER",
+    ):
+        _add_column_if_missing("group_settings", coldef)
+
+    # اگه learned_words قدیمی (بدون teacher_id) باشه، جدولش رو با نگه‌داشتن داده‌ها بازسازی می‌کنیم
+    if "teacher_id" not in _column_names("learned_words"):
+        c.executescript(
+            """
+            ALTER TABLE learned_words RENAME TO learned_words_old;
+            CREATE TABLE learned_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                teacher_id INTEGER NOT NULL DEFAULT 0,
+                code INTEGER NOT NULL,
+                trigger_word TEXT NOT NULL,
+                answers TEXT NOT NULL,
+                UNIQUE(chat_id, teacher_id, code)
+            );
+            INSERT INTO learned_words (id, chat_id, teacher_id, code, trigger_word, answers)
+                SELECT id, chat_id, 0, code, trigger_word, answers FROM learned_words_old;
+            DROP TABLE learned_words_old;
+            """
+        )
+        conn.commit()
+
     conn.close()
 
 
@@ -177,52 +240,84 @@ def get_settings(chat_id: int) -> sqlite3.Row:
     return row
 
 
-# ---- کلمات یاد گرفته شده -----------------------------------------------
-def add_learned_word(chat_id: int, trigger_word: str, answer: str) -> int:
+async def get_group_owner_id(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """
+    آی‌دی مالک واقعی گروه رو برمی‌گردونه (کش‌شده تو دیتابیس). فقط لیست کلمات همین آدم
+    تو گروه استفاده می‌شه، تا لیست هر ادمین دیگه‌ای خصوصیِ خودش بمونه.
+    """
+    s = get_settings(chat_id)
+    if s["owner_user_id"]:
+        return s["owner_user_id"]
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        for m in admins:
+            if m.status == ChatMemberStatus.OWNER:
+                conn = get_conn()
+                c = conn.cursor()
+                c.execute("UPDATE group_settings SET owner_user_id=? WHERE chat_id=?", (m.user.id, chat_id))
+                conn.commit()
+                conn.close()
+                return m.user.id
+    except Exception:
+        pass
+    return None
+
+
+# ---- کلمات یاد گرفته شده (هر ادمین لیست خصوصیِ خودش رو داره) ---------------
+def add_learned_word(chat_id: int, teacher_id: int, trigger_word: str, answer: str) -> int:
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT COALESCE(MAX(code), 0) + 1 FROM learned_words WHERE chat_id=?", (chat_id,))
+    c.execute(
+        "SELECT COALESCE(MAX(code), 0) + 1 FROM learned_words WHERE chat_id=? AND teacher_id=?",
+        (chat_id, teacher_id),
+    )
     new_code = c.fetchone()[0]
     c.execute(
-        "INSERT INTO learned_words (chat_id, code, trigger_word, answers) VALUES (?, ?, ?, ?)",
-        (chat_id, new_code, trigger_word.strip(), json.dumps([answer.strip()], ensure_ascii=False)),
+        "INSERT INTO learned_words (chat_id, teacher_id, code, trigger_word, answers) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, teacher_id, new_code, trigger_word.strip(), json.dumps([answer.strip()], ensure_ascii=False)),
     )
     conn.commit()
     conn.close()
     return new_code
 
 
-def list_learned_words(chat_id: int):
+def list_learned_words(chat_id: int, teacher_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM learned_words WHERE chat_id=? ORDER BY code", (chat_id,))
+    c.execute(
+        "SELECT * FROM learned_words WHERE chat_id=? AND teacher_id=? ORDER BY code",
+        (chat_id, teacher_id),
+    )
     rows = c.fetchall()
     conn.close()
     return rows
 
 
-def get_learned_word(chat_id: int, code: int):
+def get_learned_word(chat_id: int, teacher_id: int, code: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM learned_words WHERE chat_id=? AND code=?", (chat_id, code))
+    c.execute(
+        "SELECT * FROM learned_words WHERE chat_id=? AND teacher_id=? AND code=?",
+        (chat_id, teacher_id, code),
+    )
     row = c.fetchone()
     conn.close()
     return row
 
 
-def set_word_answer(chat_id: int, code: int, new_answer: str):
+def set_word_answer(chat_id: int, teacher_id: int, code: int, new_answer: str):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "UPDATE learned_words SET answers=? WHERE chat_id=? AND code=?",
-        (json.dumps([new_answer.strip()], ensure_ascii=False), chat_id, code),
+        "UPDATE learned_words SET answers=? WHERE chat_id=? AND teacher_id=? AND code=?",
+        (json.dumps([new_answer.strip()], ensure_ascii=False), chat_id, teacher_id, code),
     )
     conn.commit()
     conn.close()
 
 
-def add_extra_answer(chat_id: int, code: int, extra_answer: str):
-    row = get_learned_word(chat_id, code)
+def add_extra_answer(chat_id: int, teacher_id: int, code: int, extra_answer: str):
+    row = get_learned_word(chat_id, teacher_id, code)
     if row is None:
         return
     answers = json.loads(row["answers"])
@@ -230,17 +325,30 @@ def add_extra_answer(chat_id: int, code: int, extra_answer: str):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "UPDATE learned_words SET answers=? WHERE chat_id=? AND code=?",
-        (json.dumps(answers, ensure_ascii=False), chat_id, code),
+        "UPDATE learned_words SET answers=? WHERE chat_id=? AND teacher_id=? AND code=?",
+        (json.dumps(answers, ensure_ascii=False), chat_id, teacher_id, code),
     )
     conn.commit()
     conn.close()
 
 
-def find_matching_word(chat_id: int, text: str):
-    """اگه متن پیام دقیقا با یکی از کلمات یاد گرفته شده یکی باشه، یه جواب رندوم برمی‌گردونه."""
+def delete_learned_word(chat_id: int, teacher_id: int, code: int) -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM learned_words WHERE chat_id=? AND teacher_id=? AND code=?",
+        (chat_id, teacher_id, code),
+    )
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def find_matching_word(chat_id: int, teacher_id: int, text: str):
+    """اگه متن پیام دقیقا با یکی از کلمات یاد گرفته شده‌ی همون معلم (مثلا مالک گروه) یکی باشه، جواب رندوم برمی‌گردونه."""
     text_norm = text.strip()
-    for row in list_learned_words(chat_id):
+    for row in list_learned_words(chat_id, teacher_id):
         if row["trigger_word"].strip() == text_norm:
             answers = json.loads(row["answers"])
             if answers:
@@ -248,8 +356,15 @@ def find_matching_word(chat_id: int, text: str):
     return None
 
 
-# ---- مالک گروه (برای اینکه فقط مالک بتونه کلمه یاد بده) --------------------
+# ---- سوپرادمین (تو): تو هر گروهی که ربات عضوشه دسترسی کامل داره -------------
+def is_super_admin(user_id: int) -> bool:
+    return user_id in SUPER_ADMIN_IDS
+
+
+# ---- مالک گروه (برای اینکه فقط ادمین‌ها بتونن لیست خصوصی کلمه بسازن) --------
 async def is_user_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    if is_super_admin(user_id):
+        return True
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         return member.status == ChatMemberStatus.OWNER
@@ -259,7 +374,9 @@ async def is_user_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_i
 
 # ---- ادمین‌ها -------------------------------------------------------------
 async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int) -> bool:
-    """ادمین یعنی: ادمین/مالک واقعی گروه در تلگرام، یا کسی که دستی به لیست ادمین‌های ربات اضافه شده."""
+    """ادمین یعنی: سوپرادمین ربات، ادمین/مالک واقعی گروه در تلگرام، یا کسی که دستی اضافه شده."""
+    if is_super_admin(user_id):
+        return True
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
@@ -467,6 +584,8 @@ def admin_menu_keyboard():
             [InlineKeyboardButton("🗑 حذف پیام‌ها", callback_data="adm_delete_msgs")],
             [InlineKeyboardButton("🌟 افراد ویژه", callback_data="adm_special")],
             [InlineKeyboardButton("⚙️ تنظیمات گروه", callback_data="adm_settings")],
+            [InlineKeyboardButton("👥 تعداد اعضا", callback_data="adm_member_count"),
+             InlineKeyboardButton("🔗 لینک دعوت", callback_data="adm_invite_link")],
         ]
     )
 
@@ -582,6 +701,7 @@ async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------------------
 # قابلیت: یاد دادن کلمه (مکالمه ۲ مرحله‌ای) - هم با دکمه شیشه‌ای، هم با دستور /addword
+# هر ادمین لیست خصوصیِ خودش رو می‌سازه؛ تو گروه فقط لیست خودِ مالک واقعی گروه اجرا می‌شه.
 # ---------------------------------------------------------------------------
 async def learn_word_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
@@ -602,11 +722,15 @@ async def learn_word_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply(update, "برای کدوم گروه می‌خوای کلمه یاد بدی؟", InlineKeyboardMarkup(buttons))
         return ConversationHandler.END
 
-    if not await is_user_owner(context, chat_id, update.effective_user.id):
-        await _reply(update, "⛔ یاد دادن کلمه فقط توسط مالک گروه ممکنه.")
+    if not await is_user_admin(update, context, update.effective_user.id, chat_id):
+        await _reply(update, "⛔ یاد دادن کلمه فقط برای ادمین‌های گروه ممکنه.")
         return ConversationHandler.END
 
-    await _reply(update, "اون کلمه‌ای که می‌خوای وقتی مردم گفتن ربات جواب بده رو بفرست.\nمثلا: سلام")
+    await _reply(
+        update,
+        "اون کلمه‌ای که می‌خوای وقتی مردم گفتن ربات جواب بده رو بفرست.\nمثلا: سلام\n\n"
+        "توجه: این لیستِ خصوصیِ خودته. تو گروه فقط لیستِ مالکِ واقعیِ گروه اجرا می‌شه.",
+    )
     return LEARN_WORD_WAIT_TRIGGER
 
 
@@ -624,21 +748,23 @@ async def learn_word_got_answer(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("یه مشکلی پیش اومد، دوباره از منو شروع کن.")
         return ConversationHandler.END
     chat_id = active_chat_id(update, context)
-    code = add_learned_word(chat_id, trigger, update.message.text)
+    teacher_id = update.effective_user.id
+    code = add_learned_word(chat_id, teacher_id, trigger, update.message.text)
     await update.message.reply_text(
-        f"✅ ثبت شد!\nکد: {code}\nکلمه: {trigger}\nجواب: {update.message.text}"
+        f"✅ ثبت شد (تو لیست خصوصی خودت)!\nکد: {code}\nکلمه: {trigger}\nجواب: {update.message.text}"
     )
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
 # قابلیت: دیدن کلمات ساخته شده - هم با دکمه شیشه‌ای، هم با دستور /mywords
+# هر کسی فقط لیست خودش رو می‌بینه؛ لیست بقیه (حتی لیست مالک) براش قابل دیدن نیست.
 # ---------------------------------------------------------------------------
-def build_words_list_text(chat_id: int) -> str:
-    rows = list_learned_words(chat_id)
+def build_words_list_text(chat_id: int, teacher_id: int) -> str:
+    rows = list_learned_words(chat_id, teacher_id)
     if not rows:
-        return "هنوز هیچ کلمه‌ای یاد داده نشده."
-    lines = ["لیست کلمات یاد گرفته شده:\n"]
+        return "هنوز هیچ کلمه‌ای تو لیست خصوصی تو یاد داده نشده."
+    lines = ["لیست کلمات یاد گرفته شده‌ی تو:\n"]
     for r in rows:
         answers = json.loads(r["answers"])
         answer_display = answers[0] if len(answers) == 1 else " | ".join(answers)
@@ -646,8 +772,8 @@ def build_words_list_text(chat_id: int) -> str:
     return "\n".join(lines)
 
 
-def words_list_keyboard(chat_id: int):
-    rows = list_learned_words(chat_id)
+def words_list_keyboard(chat_id: int, teacher_id: int):
+    rows = list_learned_words(chat_id, teacher_id)
     buttons = []
     row_buf = []
     for r in rows:
@@ -658,6 +784,8 @@ def words_list_keyboard(chat_id: int):
     if row_buf:
         buttons.append(row_buf)
     buttons.append([InlineKeyboardButton("➕ اضافه کردن جدید", callback_data="learn_word")])
+    if rows:
+        buttons.append([InlineKeyboardButton("🗑 حذف یه کلمه", callback_data="worddel_start")])
     buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
@@ -671,7 +799,7 @@ async def view_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply(
                 update,
                 "اول باید ربات رو به یه گروه اضافه کنی و اونجا یه پیام (مثلا /start) بفرستی، "
-                "بعد از همینجا می‌تونی کلمات اون گروه رو ببینی.",
+                "بعد از همینجا می‌تونی کلمات خودت رو ببینی.",
             )
         else:
             buttons = [
@@ -680,7 +808,8 @@ async def view_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await _reply(update, "کلمات کدوم گروه رو می‌خوای ببینی؟", InlineKeyboardMarkup(buttons))
         return
-    await _reply(update, build_words_list_text(chat_id), words_list_keyboard(chat_id))
+    teacher_id = update.effective_user.id
+    await _reply(update, build_words_list_text(chat_id, teacher_id), words_list_keyboard(chat_id, teacher_id))
 
 
 async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -717,8 +846,8 @@ async def word_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def word_action_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = active_chat_id(update, context)
-    if not await is_user_owner(context, chat_id, update.effective_user.id):
-        await query.answer("⛔ ویرایش کلمه‌ها فقط برای مالک گروه ممکنه.", show_alert=True)
+    if not await is_user_admin(update, context, update.effective_user.id, chat_id):
+        await query.answer("⛔ ویرایش کلمه‌ها فقط برای ادمین‌ها ممکنه.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
     context.user_data["edit_mode"] = "change"
@@ -729,8 +858,8 @@ async def word_action_change(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def word_action_add_extra(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = active_chat_id(update, context)
-    if not await is_user_owner(context, chat_id, update.effective_user.id):
-        await query.answer("⛔ ویرایش کلمه‌ها فقط برای مالک گروه ممکنه.", show_alert=True)
+    if not await is_user_admin(update, context, update.effective_user.id, chat_id):
+        await query.answer("⛔ ویرایش کلمه‌ها فقط برای ادمین‌ها ممکنه.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
     context.user_data["edit_mode"] = "extra"
@@ -744,15 +873,43 @@ async def word_edit_got_answer(update: Update, context: ContextTypes.DEFAULT_TYP
     code = context.user_data.pop("edit_code", None)
     mode = context.user_data.pop("edit_mode", None)
     chat_id = active_chat_id(update, context)
+    teacher_id = update.effective_user.id
     if code is None:
         await update.message.reply_text("یه مشکلی پیش اومد، دوباره امتحان کن.")
         return ConversationHandler.END
     if mode == "change":
-        set_word_answer(chat_id, code, update.message.text)
+        set_word_answer(chat_id, teacher_id, code, update.message.text)
         await update.message.reply_text(f"✅ جواب کد {code} عوض شد.")
     else:
-        add_extra_answer(chat_id, code, update.message.text)
+        add_extra_answer(chat_id, teacher_id, code, update.message.text)
         await update.message.reply_text(f"✅ جواب جدید به کد {code} اضافه شد.")
+    return ConversationHandler.END
+
+
+# ---- حذف کامل یه کلمه با کد -------------------------------------------------
+async def worddel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = active_chat_id(update, context)
+    if not await is_user_admin(update, context, update.effective_user.id, chat_id):
+        await query.answer("⛔ حذف کلمه فقط برای ادمین‌ها ممکنه.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    await query.edit_message_text("کد کلمه‌ای که می‌خوای کامل حذف بشه رو بفرست.")
+    return DELETE_WORD_WAIT_CODE
+
+
+async def worddel_got_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        code = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("لطفا فقط عدد کدِ کلمه رو بفرست.")
+        return DELETE_WORD_WAIT_CODE
+    chat_id = active_chat_id(update, context)
+    teacher_id = update.effective_user.id
+    if delete_learned_word(chat_id, teacher_id, code):
+        await update.message.reply_text(f"✅ کلمه با کد {code} کامل حذف شد.")
+    else:
+        await update.message.reply_text(f"کلمه‌ای با کد {code} تو لیست خودت پیدا نکردم.")
     return ConversationHandler.END
 
 
@@ -769,6 +926,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ این بخش فقط برای ادمین‌های گروه است.")
         return
     record_user_group(user.id, chat.id, chat.title)
+    await get_group_owner_id(context, chat.id)  # کش مالک گروه رو تازه/آماده نگه می‌داره
     await update.message.reply_text("پنل مدیریت گروه 🛠", reply_markup=admin_menu_keyboard())
 
 
@@ -1152,35 +1310,76 @@ async def special_tone_got_text(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ---- تنظیمات گروه ---------------------------------------------------------------
+def _toggle_col(s, col_name: str) -> str:
+    return "✅ مجاز" if s[col_name] else "❌ ممنوع"
+
+
 async def adm_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard_admin_callback(update, context):
         return
     chat_id = update.effective_chat.id
     s = get_settings(chat_id)
-    forward_text = "✅ مجاز" if s["forward_allowed"] else "❌ ممنوع"
-    spam_text = "✅ فعال" if s["spam_protection"] else "❌ غیرفعال"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"فوروارد پیام: {forward_text}", callback_data="set_toggle_forward")],
-            [InlineKeyboardButton(f"محافظت اسپم: {spam_text}", callback_data="set_toggle_spam")],
+            [InlineKeyboardButton(f"فوروارد پیام: {_toggle_col(s, 'forward_allowed')}", callback_data="set_toggle_forward")],
+            [InlineKeyboardButton(f"عکس: {_toggle_col(s, 'allow_photo')}", callback_data="set_toggle_photo")],
+            [InlineKeyboardButton(f"فیلم: {_toggle_col(s, 'allow_video')}", callback_data="set_toggle_video")],
+            [InlineKeyboardButton(f"استیکر و گیف: {_toggle_col(s, 'allow_sticker_gif')}", callback_data="set_toggle_sticker")],
+            [InlineKeyboardButton("🚨 اسپم", callback_data="set_spam_menu")],
             [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back")],
         ]
     )
-    await update.callback_query.edit_message_text("تنظیمات گروه، هر مورد رو می‌تونی روشن/خاموش کنی:", reply_markup=keyboard)
+    await update.callback_query.edit_message_text("تنظیمات گروه، هر مورد رو می‌تونی روشن/خاموش یا تنظیم کنی:", reply_markup=keyboard)
 
 
-async def set_toggle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _toggle_setting_and_refresh(update, context, column: str):
     if not await _guard_admin_callback(update, context):
         return
     chat_id = update.effective_chat.id
     s = get_settings(chat_id)
-    new_val = 0 if s["forward_allowed"] else 1
+    new_val = 0 if s[column] else 1
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE group_settings SET forward_allowed=? WHERE chat_id=?", (new_val, chat_id))
+    c.execute(f"UPDATE group_settings SET {column}=? WHERE chat_id=?", (new_val, chat_id))
     conn.commit()
     conn.close()
     await adm_settings_menu(update, context)
+
+
+async def set_toggle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_setting_and_refresh(update, context, "forward_allowed")
+
+
+async def set_toggle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_setting_and_refresh(update, context, "allow_photo")
+
+
+async def set_toggle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_setting_and_refresh(update, context, "allow_video")
+
+
+async def set_toggle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_setting_and_refresh(update, context, "allow_sticker_gif")
+
+
+# ---- زیرمنوی اسپم: روشن/خاموش + تنظیمات (چند پیام پشت سرهم / چند دقیقه سکوت) ----
+async def set_spam_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    s = get_settings(chat_id)
+    status = "✅ روشن" if s["spam_protection"] else "❌ خاموش"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"وضعیت: {status}", callback_data="set_toggle_spam")],
+            [InlineKeyboardButton(
+                f"⚙️ تنظیمات (فعلا: {s['spam_threshold']} پیام ← {s['spam_mute_minutes']} دقیقه سکوت)",
+                callback_data="set_spam_config_start",
+            )],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_settings")],
+        ]
+    )
+    await update.callback_query.edit_message_text("حالتت رو انتخاب کن:", reply_markup=keyboard)
 
 
 async def set_toggle_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1194,7 +1393,84 @@ async def set_toggle_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("UPDATE group_settings SET spam_protection=? WHERE chat_id=?", (new_val, chat_id))
     conn.commit()
     conn.close()
-    await adm_settings_menu(update, context)
+    await set_spam_menu(update, context)
+
+
+async def set_spam_config_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return ConversationHandler.END
+    await update.callback_query.edit_message_text(
+        "چند تا پیام پشت سر هم از یه کاربر ارسال بشه تا براش سکوت بزنم؟ یه عدد بفرست."
+    )
+    return SPAM_CFG_WAIT_THRESHOLD
+
+
+async def set_spam_config_got_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        n = int(update.message.text.strip())
+        if n < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("لطفا یه عدد صحیح بزرگ‌تر از صفر بفرست.")
+        return SPAM_CFG_WAIT_THRESHOLD
+    context.user_data["spam_cfg_threshold"] = n
+    await update.message.reply_text(f"باشه. حالا چند دقیقه سکوت بدم؟ (حداکثر {MAX_SPAM_MUTE_MINUTES} دقیقه)")
+    return SPAM_CFG_WAIT_MUTE
+
+
+async def set_spam_config_got_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        minutes = int(update.message.text.strip())
+        if minutes < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("لطفا یه عدد صحیح بزرگ‌تر از صفر بفرست.")
+        return SPAM_CFG_WAIT_MUTE
+    minutes = min(minutes, MAX_SPAM_MUTE_MINUTES)
+    threshold = context.user_data.pop("spam_cfg_threshold", 5)
+    chat_id = update.effective_chat.id
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE group_settings SET spam_threshold=?, spam_mute_minutes=? WHERE chat_id=?",
+        (threshold, minutes, chat_id),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ تنظیم شد: بعد از {threshold} پیام پشت‌سرهم از یه کاربر، {minutes} دقیقه سکوت می‌شه."
+    )
+    return ConversationHandler.END
+
+
+# ---- تعداد اعضا و لینک دعوت ------------------------------------------------------
+async def adm_member_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    try:
+        count = await context.bot.get_chat_member_count(chat_id)
+        await update.callback_query.edit_message_text(
+            f"👥 تعداد اعضای گروه: {count}", reply_markup=back_to_admin_keyboard()
+        )
+    except Exception as e:
+        await update.callback_query.edit_message_text(f"نشد تعداد اعضا رو بگیرم: {e}", reply_markup=back_to_admin_keyboard())
+
+
+async def adm_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    try:
+        link = await context.bot.export_chat_invite_link(chat_id)
+        await update.callback_query.edit_message_text(
+            f"🔗 لینک دعوت گروه:\n{link}", reply_markup=back_to_admin_keyboard()
+        )
+    except Exception as e:
+        await update.callback_query.edit_message_text(
+            f"نشد لینک دعوت رو بگیرم (باید ربات دسترسی 'دعوت با لینک' داشته باشه): {e}",
+            reply_markup=back_to_admin_keyboard(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1529,24 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 await msg.reply_text(f"نتونستم سکوتش کنم: {e}")
             return
 
+        # پین سریع - "پین"
+        if text_stripped == "پین":
+            try:
+                await context.bot.pin_chat_message(chat_id, msg.reply_to_message.message_id)
+                await msg.reply_text("📌 پیام پین شد.")
+            except Exception as e:
+                await msg.reply_text(f"نتونستم پینش کنم: {e}")
+            return
+
+        # آنپین سریع - "آنپین"
+        if text_stripped == "آنپین":
+            try:
+                await context.bot.unpin_chat_message(chat_id, msg.reply_to_message.message_id)
+                await msg.reply_text("📌 پین پیام برداشته شد.")
+            except Exception as e:
+                await msg.reply_text(f"نتونستم آنپینش کنم: {e}")
+            return
+
     # تنظیم فوروارد: اگه فوروارد ممنوع باشه و پیام فوروارد شده باشه، حذفش کن
     settings = get_settings(chat_id)
     if msg.forward_origin is not None and not settings["forward_allowed"]:
@@ -1262,6 +1556,32 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
         return
+
+    # محافظت اسپم: اگه فعال باشه و کاربر (غیر ادمین/غیر ویژه) پشت سر هم پیام بده، سکوتش می‌کنیم
+    if settings["spam_protection"] and not await is_user_admin(update, context, user.id, chat_id) \
+            and not is_special_member(chat_id, user.id):
+        spam_key = f"spam_{chat_id}"
+        state = context.chat_data.get(spam_key, {"user_id": None, "count": 0})
+        if state["user_id"] == user.id:
+            state["count"] += 1
+        else:
+            state = {"user_id": user.id, "count": 1}
+        context.chat_data[spam_key] = state
+        if state["count"] >= settings["spam_threshold"]:
+            minutes = min(settings["spam_mute_minutes"], MAX_SPAM_MUTE_MINUTES)
+            try:
+                until = datetime.utcnow().timestamp() + minutes * 60
+                await context.bot.restrict_chat_member(
+                    chat_id, user.id, permissions=ChatPermissions(can_send_messages=False), until_date=int(until)
+                )
+                await context.bot.send_message(
+                    chat_id,
+                    f"🔇 {user.first_name} به خاطر ارسال پشت‌سرهم پیام (اسپم)، {minutes} دقیقه سکوت شد.",
+                )
+            except Exception:
+                pass
+            context.chat_data[spam_key] = {"user_id": None, "count": 0}
+            return
 
     # کلمات ممنوعه (اعضای ویژه معاف هستن)
     if not is_special_member(chat_id, user.id):
@@ -1294,10 +1614,44 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     pass
             return
 
-    # جواب به کلمات یاد گرفته شده
-    answer = find_matching_word(chat_id, msg.text)
-    if answer:
-        await msg.reply_text(answer)
+    # جواب به کلمات یاد گرفته شده - فقط لیستِ مالکِ واقعیِ گروه اجرا می‌شه
+    owner_id = await get_group_owner_id(context, chat_id)
+    if owner_id:
+        answer = find_matching_word(chat_id, owner_id, msg.text)
+        if answer:
+            await msg.reply_text(answer)
+
+
+async def group_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """چک می‌کنه که آیا عکس/فیلم/استیکر/گیف تو این گروه مجازه یا نه (تنظیمات گروه)."""
+    msg = update.message
+    if msg is None:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    chat_id = chat.id
+    user = update.effective_user
+    settings = get_settings(chat_id)
+    is_admin_user = await is_user_admin(update, context, user.id, chat_id)
+
+    blocked_reason = None
+    if msg.photo and not settings["allow_photo"] and not is_admin_user:
+        blocked_reason = "ارسال عکس"
+    elif msg.video and not settings["allow_video"] and not is_admin_user:
+        blocked_reason = "ارسال فیلم"
+    elif (msg.sticker or msg.animation) and not settings["allow_sticker_gif"] and not is_admin_user:
+        blocked_reason = "ارسال استیکر/گیف"
+
+    if blocked_reason:
+        try:
+            await msg.delete()
+            await context.bot.send_message(chat_id, f"{user.first_name} {blocked_reason} تو این گروه غیرفعاله.")
+        except Exception:
+            pass
+        return
+
+    track_message(chat_id, msg.message_id)
 
 
 async def non_admin_click_guard_no_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1361,6 +1715,16 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(word_edit_menu, pattern="^word_edit_\\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_main_menu, pattern="^back_main$"))
 
+    # مکالمه: حذف کامل یه کلمه با کد
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(worddel_start, pattern="^worddel_start$")],
+            states={DELETE_WORD_WAIT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, worddel_got_code)]},
+            fallbacks=[CommandHandler("cancel", cancel_conversation)],
+            per_message=False,
+        )
+    )
+
     # پنل ادمین: منوی اصلی و بازگشت
     app.add_handler(CallbackQueryHandler(admin_back, pattern="^adm_back$"))
     app.add_handler(CallbackQueryHandler(adm_lock, pattern="^adm_lock$"))
@@ -1369,11 +1733,30 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(adm_delete_msgs_menu, pattern="^adm_delete_msgs$"))
     app.add_handler(CallbackQueryHandler(adm_special_menu, pattern="^adm_special$"))
     app.add_handler(CallbackQueryHandler(adm_settings_menu, pattern="^adm_settings$"))
+    app.add_handler(CallbackQueryHandler(adm_member_count, pattern="^adm_member_count$"))
+    app.add_handler(CallbackQueryHandler(adm_invite_link, pattern="^adm_invite_link$"))
     app.add_handler(CallbackQueryHandler(set_toggle_forward, pattern="^set_toggle_forward$"))
+    app.add_handler(CallbackQueryHandler(set_toggle_photo, pattern="^set_toggle_photo$"))
+    app.add_handler(CallbackQueryHandler(set_toggle_video, pattern="^set_toggle_video$"))
+    app.add_handler(CallbackQueryHandler(set_toggle_sticker, pattern="^set_toggle_sticker$"))
+    app.add_handler(CallbackQueryHandler(set_spam_menu, pattern="^set_spam_menu$"))
     app.add_handler(CallbackQueryHandler(set_toggle_spam, pattern="^set_toggle_spam$"))
     app.add_handler(CallbackQueryHandler(del_all_callback, pattern="^del_all$"))
     app.add_handler(CallbackQueryHandler(warn_view_callback, pattern="^warnview_\\d+$"))
     app.add_handler(CallbackQueryHandler(warn_remove_callback, pattern="^warnremove_\\d+$"))
+
+    # مکالمه: تنظیمات اسپم (چند پیام پشت سرهم / چند دقیقه سکوت)
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(set_spam_config_start, pattern="^set_spam_config_start$")],
+            states={
+                SPAM_CFG_WAIT_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_spam_config_got_threshold)],
+                SPAM_CFG_WAIT_MUTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_spam_config_got_mute)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_conversation)],
+            per_message=False,
+        )
+    )
 
     # مکالمه: دادن لقب
     app.add_handler(
@@ -1455,6 +1838,14 @@ def build_application() -> Application:
 
     # هندلر عمومی پیام‌های متنی گروه (باید بعد از همه ConversationHandler ها ثبت بشه)
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, group_message_handler))
+
+    # هندلر رسانه‌های گروه: عکس/فیلم/استیکر/گیف (طبق تنظیمات گروه مجاز یا حذف می‌شن)
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.VIDEO | filters.Sticker.ALL | filters.ANIMATION) & filters.ChatType.GROUPS,
+            group_media_handler,
+        )
+    )
 
     app.post_init = setup_bot_menu
     return app
