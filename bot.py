@@ -65,7 +65,7 @@ if _env_super_admins:
 # دیکشنری به اسم DEFAULT_PACK هست (دقیقاً مثل چیزی که تو ریپازیتوری گذاشتی).
 # ربات این فایل رو با ast.literal_eval می‌خونه (نه exec/eval)، پس حتی اگه فایل مخرب هم باشه
 # هیچ کدی اجرا نمی‌شه؛ فقط رشته/لیست/دیکشنری ساده ازش خونده می‌شه.
-DEFAULT_PACK_URL = os.environ.get("DEFAULT_PACK_URL", "")
+DEFAULT_PACK_URL = os.environ.get("DEFAULT_PACK_URL", "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/default_pack.py")
 DEFAULT_PACK_REFRESH_SECONDS = 3600  # هر چند وقت یک‌بار خودکار از گیت‌هاب دوباره خونده بشه
 _default_pack_cache = {"data": {}, "loaded_at": None}
 
