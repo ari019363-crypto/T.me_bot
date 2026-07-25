@@ -33,6 +33,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -69,6 +70,20 @@ DEFAULT_PACK_URL = os.environ.get("DEFAULT_PACK_URL", "https://raw.githubusercon
 DEFAULT_PACK_REFRESH_SECONDS = 3600  # هر چند وقت یک‌بار خودکار از گیت‌هاب دوباره خونده بشه
 _default_pack_cache = {"data": {}, "loaded_at": None}
 
+# جملات پیش‌فرض «یادآوری غیبت اعضا» - هر چند وقت یک‌بار ربات یکی رو تصادفی تگ می‌کنه و یکی از این جمله‌ها رو می‌گه
+ENGAGEMENT_PHRASES = [
+    "هی خوشگل، کجایی؟ نیستی کم پیدایی! 🌸",
+    "بدون تو گپ کویره، اگه میشه برگرد ☂️",
+    "کجا گمی رفیق؟ جات اینجا خالیه!",
+    "چقدر وقته پیدات نیست، یه سر بزن ببینیم چه خبر!",
+    "دلمون برات تنگ شد، بیا یه گپی بزنیم!",
+    "گروه بدون تو رنگ و بو نداره، بیا دیگه!",
+    "پس چرا انقدر کم‌پیدایی؟ منتظرتیم!",که",
+    "یه سر بزن حداقل، دلمون تنگ شده!",
+    "کجایی که این‌جا سوت و کوره بدون تو!",
+    "بیا یه چیزی بگو، جات خالیه اینجا!",
+]
+
 # مراحل مکالمه (ConversationHandler states)
 (
     LEARN_WORD_WAIT_TRIGGER,
@@ -87,7 +102,8 @@ _default_pack_cache = {"data": {}, "loaded_at": None}
     DELETE_WORD_WAIT_CODE,
     SPAM_CFG_WAIT_THRESHOLD,
     SPAM_CFG_WAIT_MUTE,
-) = range(16)
+    ENGAGEMENT_WAIT_HOURS,
+) = range(17)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +215,10 @@ def init_db():
         "allow_sticker_gif INTEGER NOT NULL DEFAULT 1",
         "owner_user_id INTEGER",
         "use_default_pack INTEGER NOT NULL DEFAULT 0",
+        "block_links INTEGER NOT NULL DEFAULT 0",
+        "engagement_enabled INTEGER NOT NULL DEFAULT 0",
+        "engagement_interval_hours INTEGER NOT NULL DEFAULT 6",
+        "last_engagement_at TEXT",
     ):
         _add_column_if_missing("group_settings", coldef)
 
@@ -368,13 +388,25 @@ def delete_learned_word(chat_id: int, teacher_id: int, code: int) -> bool:
 
 
 def find_matching_word(chat_id: int, teacher_id: int, text: str):
-    """اگه متن پیام دقیقا با یکی از کلمات یاد گرفته شده‌ی همون معلم (مثلا مالک گروه) یکی باشه، جواب رندوم برمی‌گردونه."""
+    """
+    اگه یکی از کلمات یاد گرفته شده‌ی همون معلم (مثلا مالک گروه) هرجایی داخل متن پیام باشه
+    (نه فقط وقتی پیام دقیقاً همون کلمه باشه)، جواب رندوم برمی‌گردونه. اگه چندتا کلمه هم‌زمان
+    تو پیام پیدا بشن، اونی که طولانی‌تره (دقیق‌تره) در اولویته.
+    """
     text_norm = text.strip()
+    if not text_norm:
+        return None
+    best_row = None
+    best_len = -1
     for row in list_learned_words(chat_id, teacher_id):
-        if row["trigger_word"].strip() == text_norm:
-            answers = json.loads(row["answers"])
-            if answers:
-                return random.choice(answers)
+        trig = row["trigger_word"].strip()
+        if trig and trig in text_norm and len(trig) > best_len:
+            best_row = row
+            best_len = len(trig)
+    if best_row:
+        answers = json.loads(best_row["answers"])
+        if answers:
+            return random.choice(answers)
     return None
 
 
@@ -681,9 +713,20 @@ async def get_default_pack(force_refresh: bool = False) -> dict:
 def find_in_default_pack(pack: dict, text: str):
     if not pack:
         return None
-    answers = pack.get(text.strip())
-    if answers:
-        return random.choice(answers)
+    text_norm = text.strip()
+    if not text_norm:
+        return None
+    best_key = None
+    best_len = -1
+    for trig in pack.keys():
+        trig_s = trig.strip()
+        if trig_s and trig_s in text_norm and len(trig_s) > best_len:
+            best_key = trig
+            best_len = len(trig_s)
+    if best_key is not None:
+        answers = pack.get(best_key)
+        if answers:
+            return random.choice(answers)
     return None
 
 
@@ -705,6 +748,7 @@ def admin_menu_keyboard():
             [InlineKeyboardButton("🗨 کلمه‌های آماده", callback_data="adm_ready_words")],
             [InlineKeyboardButton("👥 تعداد اعضا", callback_data="adm_member_count"),
              InlineKeyboardButton("🔗 لینک دعوت", callback_data="adm_invite_link")],
+            [InlineKeyboardButton("❌ بستن پنل", callback_data="adm_close_panel")],
         ]
     )
 
@@ -1055,6 +1099,15 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("پنل مدیریت گروه 🛠", reply_markup=admin_menu_keyboard())
 
 
+async def adm_close_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    try:
+        await update.callback_query.message.delete()
+    except Exception:
+        await update.callback_query.edit_message_text("پنل بسته شد. ✅")
+
+
 async def _guard_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """چک می‌کنه که آیا کاربری که روی دکمه ادمین کلیک کرده واقعا ادمینه یا نه."""
     query = update.callback_query
@@ -1145,14 +1198,35 @@ async def adm_title_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("باید روی پیام همون عضو ریپلای کنی. دوباره امتحان کن.")
         return ADD_TITLE_WAIT_TEXT
     target = update.message.reply_to_message.from_user
+    if target is None:
+        await update.message.reply_text("نتونستم فرستنده‌ی این پیام رو شناسایی کنم.")
+        return ConversationHandler.END
     chat_id = update.effective_chat.id
     title_text = update.message.text[:16]  # تلگرام حداکثر ۱۶ کاراکتر برای لقب اجازه می‌ده
     try:
+        # تلگرام فقط به کسی که از قبل «ادمین» گروهه اجازه‌ی داشتن لقب می‌ده؛ اگه عضو عادیه،
+        # اول با حداقل اختیار (فقط برای داشتن لقب، بدون هیچ دسترسی واقعی) ادمینش می‌کنیم.
+        member = await context.bot.get_chat_member(chat_id, target.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await context.bot.promote_chat_member(
+                chat_id,
+                target.id,
+                can_manage_chat=False,
+                can_delete_messages=False,
+                can_manage_video_chats=False,
+                can_restrict_members=False,
+                can_promote_members=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_post_messages=False,
+                can_edit_messages=False,
+                can_pin_messages=False,
+            )
         await context.bot.set_chat_administrator_custom_title(chat_id, target.id, title_text)
         await update.message.reply_text(f"✅ لقب «{title_text}» به {target.first_name} داده شد.")
     except Exception as e:
         await update.message.reply_text(
-            f"نشد لقب رو ثبت کنم. توجه: تلگرام فقط به ادمین‌های گروه اجازه لقب می‌ده. خطا: {e}"
+            f"نشد لقب رو ثبت کنم (باید ربات دسترسی 'افزودن ادمین جدید' داشته باشه): {e}"
         )
     return ConversationHandler.END
 
@@ -1181,6 +1255,35 @@ async def perform_warn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target,
             remove_all_warnings(chat_id, target.id)
         except Exception as e:
             await send_tracked(context.bot, chat_id, f"نتونستم کاربر رو حذف کنم: {e}")
+
+
+# ---- اخطار خودکار مشترک برای هر چیزی که تو گروه ممنوع اعلام شده (کلمه ممنوعه/رسانه/فوروارد/لینک) ----
+async def warn_and_maybe_ban(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, violation_text: str):
+    count = add_warning(chat_id, user.id, violation_text)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👁 مشاهده پیام", callback_data=f"warnview_{user.id}")],
+            [InlineKeyboardButton("✅ حذف اخطار", callback_data=f"warnremove_{user.id}")],
+        ]
+    )
+    await send_tracked(
+        context.bot,
+        chat_id,
+        f"{user.first_name} اینجا {violation_text} ممنوعه، این کارو نکن! ({count} اخطار از {MAX_WARNINGS})",
+        reply_markup=keyboard,
+    )
+    if count >= MAX_WARNINGS:
+        try:
+            await context.bot.ban_chat_member(chat_id, user.id)
+            await send_tracked(
+                context.bot, chat_id, f"🚫 {user.first_name} به دلیل رسیدن به {MAX_WARNINGS} اخطار حذف شد."
+            )
+            remove_all_warnings(chat_id, user.id)
+        except Exception:
+            pass
+
+
+URL_PATTERN = re.compile(r"(https?://|t\.me/|www\.)\S+", re.IGNORECASE)
 
 
 async def adm_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1438,13 +1541,16 @@ async def adm_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     s = get_settings(chat_id)
+    link_status = "❌ ممنوع" if s["block_links"] else "✅ مجاز"
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(f"فوروارد پیام: {_toggle_col(s, 'forward_allowed')}", callback_data="set_toggle_forward")],
             [InlineKeyboardButton(f"عکس: {_toggle_col(s, 'allow_photo')}", callback_data="set_toggle_photo")],
             [InlineKeyboardButton(f"فیلم: {_toggle_col(s, 'allow_video')}", callback_data="set_toggle_video")],
             [InlineKeyboardButton(f"استیکر و گیف: {_toggle_col(s, 'allow_sticker_gif')}", callback_data="set_toggle_sticker")],
+            [InlineKeyboardButton(f"لینک (اعضای عادی): {link_status}", callback_data="set_toggle_links")],
             [InlineKeyboardButton("🚨 اسپم", callback_data="set_spam_menu")],
+            [InlineKeyboardButton("💌 یادآوری غیبت اعضا", callback_data="eng_menu")],
             [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back")],
         ]
     )
@@ -1479,6 +1585,10 @@ async def set_toggle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_toggle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _toggle_setting_and_refresh(update, context, "allow_sticker_gif")
+
+
+async def set_toggle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_setting_and_refresh(update, context, "block_links")
 
 
 # ---- زیرمنوی اسپم: روشن/خاموش + تنظیمات (چند پیام پشت سرهم / چند دقیقه سکوت) ----
@@ -1559,6 +1669,67 @@ async def set_spam_config_got_mute(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(
         f"✅ تنظیم شد: بعد از {threshold} پیام پشت‌سرهم از یه کاربر، {minutes} دقیقه سکوت می‌شه."
     )
+    return ConversationHandler.END
+
+
+# ---- زیرمنوی یادآوری غیبت اعضا: هر چند ساعت یک‌بار یکی رو تصادفی تگ می‌کنه ----
+async def eng_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    s = get_settings(chat_id)
+    status = "✅ روشن" if s["engagement_enabled"] else "❌ خاموش"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"وضعیت: {status}", callback_data="eng_toggle")],
+            [InlineKeyboardButton(
+                f"⚙️ فاصله زمانی (فعلا هر {s['engagement_interval_hours']} ساعت)", callback_data="eng_interval_start"
+            )],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_settings")],
+        ]
+    )
+    await update.callback_query.edit_message_text(
+        "هر چند وقت یک‌بار یه عضو رو تصادفی تگ می‌کنم و یه جمله‌ی باحال بهش می‌گم تا گروه رو زنده نگه داره:",
+        reply_markup=keyboard,
+    )
+
+
+async def eng_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    s = get_settings(chat_id)
+    new_val = 0 if s["engagement_enabled"] else 1
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE group_settings SET engagement_enabled=? WHERE chat_id=?", (new_val, chat_id))
+    conn.commit()
+    conn.close()
+    await eng_menu(update, context)
+
+
+async def eng_interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return ConversationHandler.END
+    await update.callback_query.edit_message_text("هر چند ساعت یک‌بار این پیام‌ها رو بفرستم؟ یه عدد بفرست.")
+    return ENGAGEMENT_WAIT_HOURS
+
+
+async def eng_interval_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        hours = int(update.message.text.strip())
+        if hours < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("لطفا یه عدد صحیح بزرگ‌تر از صفر بفرست.")
+        return ENGAGEMENT_WAIT_HOURS
+    chat_id = update.effective_chat.id
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE group_settings SET engagement_interval_hours=? WHERE chat_id=?", (hours, chat_id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ تنظیم شد: هر {hours} ساعت یک‌بار.")
     return ConversationHandler.END
 
 
@@ -1712,9 +1883,15 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     # ---- دستورهای سریع ادمین (فقط وقتی ریپلای روی پیام یه عضو باشه و فرستنده ادمین باشه) ----
     if msg.reply_to_message and await is_user_admin(update, context, user.id, chat_id):
         target = msg.reply_to_message.from_user
+        if target is None:
+            # پیام ریپلای‌شده از طرف یه ادمین ناشناس یا کانال بوده، نمی‌تونیم کاربر مشخصی رو هدف بگیریم
+            if text_stripped in ("بن", "صیکتیر", "اخطار", "آزاد") or text_stripped.startswith("اخطار ") or text_stripped == "سکوت" or re.match(r"^سکوت\s+\d+$", text_stripped):
+                await reply_tracked(msg, "نتونستم فرستنده‌ی این پیام رو شناسایی کنم (احتمالاً پیام از طرف ادمین ناشناس یا کانال بوده).")
+                return
+            target = None  # بذار بقیه‌ی دستورها (مثل پین/آنپین که نیازی به target ندارن) ادامه پیدا کنن
 
         # بن سریع - "بن" یا "صیکتیر"
-        if text_stripped in ("بن", "صیکتیر"):
+        if target is not None and text_stripped in ("بن", "صیکتیر"):
             try:
                 await context.bot.ban_chat_member(chat_id, target.id)
                 await reply_tracked(msg, f"🚫 {target.first_name} از گروه حذف شد.")
@@ -1723,50 +1900,62 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         # اخطار سریع - "اخطار" یا "اخطار <دلیل>"
-        if text_stripped == "اخطار" or text_stripped.startswith("اخطار "):
+        if target is not None and (text_stripped == "اخطار" or text_stripped.startswith("اخطار ")):
             reason = text_stripped[len("اخطار "):].strip() if text_stripped.startswith("اخطار ") else "اخطار سریع"
             await perform_warn(context, chat_id, target, reason, reply_target_message=msg)
             return
 
-        # سکوت سریع - "سکوت <عدد به دقیقه>"
-        mute_match = re.match(r"^سکوت\s+(\d+)$", text_stripped)
-        if mute_match:
-            minutes = int(mute_match.group(1))
+        # سکوت سریع - "سکوت" (نامحدود) یا "سکوت <عدد به دقیقه>" (موقت)
+        if target is not None and (text_stripped == "سکوت" or re.match(r"^سکوت\s+\d+$", text_stripped)):
+            mute_match = re.match(r"^سکوت\s+(\d+)$", text_stripped)
             try:
-                until = datetime.utcnow().timestamp() + minutes * 60
-                await context.bot.restrict_chat_member(
-                    chat_id,
-                    target.id,
-                    permissions=ChatPermissions(can_send_messages=False),
-                    until_date=int(until),
-                )
-                await reply_tracked(msg, f"🔇 {target.first_name} به مدت {minutes} دقیقه سکوت شد.")
+                if mute_match:
+                    minutes = int(mute_match.group(1))
+                    until = int(datetime.utcnow().timestamp() + minutes * 60)
+                    await context.bot.restrict_chat_member(
+                        chat_id, target.id, permissions=ChatPermissions(can_send_messages=False), until_date=until
+                    )
+                    await reply_tracked(msg, f"🔇 {target.first_name} به مدت {minutes} دقیقه سکوت شد.")
+                else:
+                    # بدون عدد = سکوت نامحدود (تا وقتی خودمون با «آزاد» بازش کنیم)
+                    await context.bot.restrict_chat_member(
+                        chat_id, target.id, permissions=ChatPermissions(can_send_messages=False)
+                    )
+                    await reply_tracked(msg, f"🔇 {target.first_name} سکوت شد (تا وقتی که با «آزاد» درش بیاری).")
             except Exception as e:
                 await reply_tracked(msg, f"نتونستم سکوتش کنم: {e}")
             return
 
         # آزاد کردن از سکوت - "آزاد"
-        if text_stripped == "آزاد":
+        if target is not None and text_stripped == "آزاد":
+            full_permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False,
+            )
             try:
-                await context.bot.restrict_chat_member(
-                    chat_id,
-                    target.id,
-                    permissions=ChatPermissions(
-                        can_send_messages=True,
-                        can_send_audios=True,
-                        can_send_documents=True,
-                        can_send_photos=True,
-                        can_send_videos=True,
-                        can_send_video_notes=True,
-                        can_send_voice_notes=True,
-                        can_send_polls=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True,
-                    ),
-                )
+                await context.bot.restrict_chat_member(chat_id, target.id, permissions=full_permissions)
                 await reply_tracked(msg, f"🔊 {target.first_name} از سکوت در اومد.")
-            except Exception as e:
-                await reply_tracked(msg, f"نتونستم آزادش کنم: {e}")
+            except Exception:
+                # اگه ست‌کردن همه‌ی مجوزها یه‌جا خطا داد (مثلا به‌خاطر تنظیمات خودِ گروه)، با کمترین
+                # مجوز لازم (فقط اجازه‌ی ارسال پیام) دوباره امتحان می‌کنیم تا حداقل صداش دربیاد
+                try:
+                    await context.bot.restrict_chat_member(
+                        chat_id, target.id, permissions=ChatPermissions(can_send_messages=True)
+                    )
+                    await reply_tracked(msg, f"🔊 {target.first_name} از سکوت در اومد.")
+                except Exception as e2:
+                    await reply_tracked(msg, f"نتونستم آزادش کنم: {e2}")
             return
 
         # پین سریع - "پین"
@@ -1787,19 +1976,29 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 await reply_tracked(msg, f"نتونستم آنپینش کنم: {e}")
             return
 
-    # تنظیم فوروارد: اگه فوروارد ممنوع باشه و پیام فوروارد شده باشه، حذفش کن
+    # تنظیم فوروارد: اگه فوروارد ممنوع باشه و پیام فوروارد شده باشه، حذف + اخطار
     settings = get_settings(chat_id)
-    if msg.forward_origin is not None and not settings["forward_allowed"]:
+    is_admin_user = await is_user_admin(update, context, user.id, chat_id)
+    is_special_user = is_special_member(chat_id, user.id)
+    if msg.forward_origin is not None and not settings["forward_allowed"] and not is_admin_user and not is_special_user:
         try:
             await msg.delete()
-            await send_tracked(context.bot, chat_id, f"فوروارد پیام در این گروه غیرفعاله، {user.first_name}.")
         except Exception:
             pass
+        await warn_and_maybe_ban(context, chat_id, user, "فوروارد پیام")
+        return
+
+    # لینک: اگه ارسال لینک ممنوع باشه، حذف + اخطار
+    if settings["block_links"] and not is_admin_user and not is_special_user and URL_PATTERN.search(msg.text):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await warn_and_maybe_ban(context, chat_id, user, "ارسال لینک")
         return
 
     # محافظت اسپم: اگه فعال باشه و کاربر (غیر ادمین/غیر ویژه) پشت سر هم پیام بده، سکوتش می‌کنیم
-    if settings["spam_protection"] and not await is_user_admin(update, context, user.id, chat_id) \
-            and not is_special_member(chat_id, user.id):
+    if settings["spam_protection"] and not is_admin_user and not is_special_user:
         spam_key = f"spam_{chat_id}"
         state = context.chat_data.get(spam_key, {"user_id": None, "count": 0})
         if state["user_id"] == user.id:
@@ -1825,35 +2024,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
     # کلمات ممنوعه (اعضای ویژه معاف هستن)
-    if not is_special_member(chat_id, user.id):
+    if not is_special_user:
         bad_word = contains_forbidden_word(chat_id, msg.text)
         if bad_word:
             try:
                 await msg.delete()
             except Exception:
                 pass
-            count = add_warning(chat_id, user.id, f"استفاده از کلمه ممنوعه: {bad_word}")
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("👁 مشاهده پیام", callback_data=f"warnview_{user.id}")],
-                    [InlineKeyboardButton("✅ حذف اخطار", callback_data=f"warnremove_{user.id}")],
-                ]
-            )
-            await send_tracked(
-                context.bot,
-                chat_id,
-                f"{user.first_name} شما از کلمه ممنوعه استفاده کردید و {count} اخطار از {MAX_WARNINGS} اخطار رو گرفتید.",
-                reply_markup=keyboard,
-            )
-            if count >= MAX_WARNINGS:
-                try:
-                    await context.bot.ban_chat_member(chat_id, user.id)
-                    await send_tracked(
-                        context.bot, chat_id, f"🚫 {user.first_name} به دلیل رسیدن به {MAX_WARNINGS} اخطار حذف شد."
-                    )
-                    remove_all_warnings(chat_id, user.id)
-                except Exception:
-                    pass
+            await warn_and_maybe_ban(context, chat_id, user, f"استفاده از کلمه ممنوعه ({bad_word})")
             return
 
     # جواب به کلمات یاد گرفته شده - اول لیستِ مالکِ واقعیِ گروه، بعد (اگه فعال بود) پک پیش‌فرض
@@ -1881,6 +2059,102 @@ async def group_member_update_handler(update: Update, context: ContextTypes.DEFA
         remove_group_member(chat_id, msg.left_chat_member.id)
 
 
+async def chat_member_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    هر تغییر وضعیت عضویت (جوین/لفت/بن/ارتقا) رو از طریق chat_member آپدیت می‌گیره - این روش
+    مستقل از پیام‌های سرویسِ «فلان کاربر اضافه شد» کار می‌کنه، پس قابل‌اعتمادتره.
+    """
+    cmu = update.chat_member
+    if cmu is None:
+        return
+    chat_id = cmu.chat.id
+    new_status = cmu.new_chat_member.status
+    member_user = cmu.new_chat_member.user
+    if new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        remove_group_member(chat_id, member_user.id)
+    else:
+        upsert_group_member(chat_id, member_user)
+
+
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    وقتی ربات به یه گروه اضافه می‌شه، فوراً لیست ادمین‌های اون لحظه رو ثبت می‌کنه (بیشترین کاری
+    که تلگرام به یه ربات اجازه می‌ده - گرفتن لیست کامل اعضای عادی از قبل، از طریق Bot API ممکن نیست).
+    """
+    cmu = update.my_chat_member
+    if cmu is None:
+        return
+    chat = cmu.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    new_status = cmu.new_chat_member.status
+    if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+        try:
+            admins = await context.bot.get_chat_administrators(chat.id)
+            for m in admins:
+                upsert_group_member(chat.id, m.user)
+        except Exception:
+            pass
+
+
+async def group_catch_all_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    از لحظه‌ای که ربات تو گروهه، هر پیامی (از هر نوعی - سند/صدا/لوکیشن/نظرسنجی/...، از هر کسی
+    حتی ادمین‌ها و ربات‌های دیگه) رو برای قابلیت «حذف پیام‌ها» ردیابی می‌کنه. توجه: تلگرام به هیچ
+    رباتی اجازه دسترسی به پیام‌های قبل از اضافه شدنش رو نمی‌ده؛ این فقط از همین لحظه به بعد کار می‌کنه.
+    """
+    msg = update.message
+    if msg is None:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    track_message(chat.id, msg.message_id)
+
+
+async def engagement_job(context: ContextTypes.DEFAULT_TYPE):
+    """هر بار که اجرا می‌شه، برای گروه‌هایی که این قابلیت روشنه و زمانش رسیده، یه عضو تصادفی رو تگ می‌کنه."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT chat_id, engagement_interval_hours, last_engagement_at FROM group_settings WHERE engagement_enabled=1"
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    now = datetime.utcnow()
+    for row in rows:
+        chat_id = row["chat_id"]
+        interval_hours = row["engagement_interval_hours"] or 6
+        last_at = row["last_engagement_at"]
+        due = True
+        if last_at:
+            try:
+                due = (now - datetime.fromisoformat(last_at)).total_seconds() >= interval_hours * 3600
+            except Exception:
+                due = True
+        if not due:
+            continue
+
+        members = get_group_members(chat_id)
+        if not members:
+            continue
+        member = random.choice(members)
+        phrase = random.choice(ENGAGEMENT_PHRASES)
+        mention = f'<a href="tg://user?id={member["user_id"]}">{html.escape(member["first_name"] or "کاربر")}</a>'
+        try:
+            sent = await context.bot.send_message(chat_id, f"{mention} {phrase}", parse_mode=ParseMode.HTML)
+            track_message(chat_id, sent.message_id)
+        except Exception:
+            continue
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("UPDATE group_settings SET last_engagement_at=? WHERE chat_id=?", (now.isoformat(), chat_id))
+        conn2.commit()
+        conn2.close()
+
+
 async def group_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """چک می‌کنه که آیا عکس/فیلم/استیکر/گیف تو این گروه مجازه یا نه (تنظیمات گروه)."""
     msg = update.message
@@ -1894,21 +2168,23 @@ async def group_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     upsert_group_member(chat_id, user)  # برای قابلیت تگ همگانی
     settings = get_settings(chat_id)
     is_admin_user = await is_user_admin(update, context, user.id, chat_id)
+    is_special_user = is_special_member(chat_id, user.id)
+    exempt = is_admin_user or is_special_user
 
     blocked_reason = None
-    if msg.photo and not settings["allow_photo"] and not is_admin_user:
+    if msg.photo and not settings["allow_photo"] and not exempt:
         blocked_reason = "ارسال عکس"
-    elif msg.video and not settings["allow_video"] and not is_admin_user:
+    elif msg.video and not settings["allow_video"] and not exempt:
         blocked_reason = "ارسال فیلم"
-    elif (msg.sticker or msg.animation) and not settings["allow_sticker_gif"] and not is_admin_user:
+    elif (msg.sticker or msg.animation) and not settings["allow_sticker_gif"] and not exempt:
         blocked_reason = "ارسال استیکر/گیف"
 
     if blocked_reason:
         try:
             await msg.delete()
-            await send_tracked(context.bot, chat_id, f"{user.first_name} {blocked_reason} تو این گروه غیرفعاله.")
         except Exception:
             pass
+        await warn_and_maybe_ban(context, chat_id, user, blocked_reason)
         return
 
     track_message(chat_id, msg.message_id)
@@ -2002,11 +2278,25 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(set_toggle_photo, pattern="^set_toggle_photo$"))
     app.add_handler(CallbackQueryHandler(set_toggle_video, pattern="^set_toggle_video$"))
     app.add_handler(CallbackQueryHandler(set_toggle_sticker, pattern="^set_toggle_sticker$"))
+    app.add_handler(CallbackQueryHandler(set_toggle_links, pattern="^set_toggle_links$"))
     app.add_handler(CallbackQueryHandler(set_spam_menu, pattern="^set_spam_menu$"))
     app.add_handler(CallbackQueryHandler(set_toggle_spam, pattern="^set_toggle_spam$"))
+    app.add_handler(CallbackQueryHandler(eng_menu, pattern="^eng_menu$"))
+    app.add_handler(CallbackQueryHandler(eng_toggle, pattern="^eng_toggle$"))
+    app.add_handler(CallbackQueryHandler(adm_close_panel, pattern="^adm_close_panel$"))
     app.add_handler(CallbackQueryHandler(del_all_callback, pattern="^del_all$"))
     app.add_handler(CallbackQueryHandler(warn_view_callback, pattern="^warnview_\\d+$"))
     app.add_handler(CallbackQueryHandler(warn_remove_callback, pattern="^warnremove_\\d+$"))
+
+    # مکالمه: تنظیمات یادآوری غیبت اعضا (فاصله زمانی به ساعت)
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(eng_interval_start, pattern="^eng_interval_start$")],
+            states={ENGAGEMENT_WAIT_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, eng_interval_got)]},
+            fallbacks=[CommandHandler("cancel", cancel_conversation)],
+            per_message=False,
+        )
+    )
 
     # مکالمه: تنظیمات اسپم (چند پیام پشت سرهم / چند دقیقه سکوت)
     app.add_handler(
@@ -2118,6 +2408,16 @@ def build_application() -> Application:
         )
     )
 
+    # هندلر chat_member (روش مطمئن‌تر برای ردیابی جوین/لفت/بن اعضا - برای تگ همگانی)
+    app.add_handler(ChatMemberHandler(chat_member_status_handler, ChatMemberHandler.CHAT_MEMBER))
+
+    # هندلر my_chat_member (وقتی ربات به یه گروه اضافه می‌شه، فوراً ادمین‌های اون گروه رو ثبت می‌کنه)
+    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # ردیاب عمومی: هر نوع پیامی تو گروه (سند/صدا/لوکیشن/نظرسنجی/...) رو برای «حذف پیام‌ها» ثبت می‌کنه.
+    # تو گروه جدا (group=1) ثبت شده تا مستقل از هندلرهای بالا (که ممکنه پیام رو حذف کرده باشن) اجرا بشه.
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, group_catch_all_tracker), group=1)
+
     app.post_init = setup_bot_menu
     return app
 
@@ -2141,10 +2441,19 @@ def main():
         print("⚠️  لطفا اول توکن ربات رو در متغیر BOT_TOKEN یا متغیر محیطی BOT_TOKEN قرار بده.")
         return
     init_db()
-    app = build_application()
+    app = build_applicati()
+    if app.job_queue is not None:
+        # هر ۳۰ دقیقه چک می‌کنه ببینه کدوم گروه‌ها وقتِ «یادآوری غیبت اعضا»شونه
+        app.job_queue.run_repeating(engagement_job, interval=1800, first=60)
+    else:
+        logger.warning(
+            "JobQueue فعال نیست؛ برای قابلیت «یادآوری غیبت اعضا» این پکیج رو نصب کن: "
+            "pip install \"python-telegram-bot[job-queue]==20.7\""
+        )
     logger.info("ربات چتر در حال اجراست...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+    
