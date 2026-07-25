@@ -8,10 +8,14 @@
 
 import os
 import re
+import ast
+import html
 import json
 import random
 import sqlite3
 import logging
+import asyncio
+import urllib.request
 from datetime import datetime
 
 from telegram import (
@@ -56,6 +60,14 @@ _env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "7430881772")
 if _env_super_admins:
     SUPER_ADMIN_IDS |= {int(x.strip()) for x in _env_super_admins.split(",") if x.strip().isdigit()}
 # مثال دستی: SUPER_ADMIN_IDS.add(123456789)
+
+# آدرس فایل خام (raw) پک دیالوگ‌های پیش‌فرض روی گیت‌هاب. این فایل یه فایل پایتونی با یه
+# دیکشنری به اسم DEFAULT_PACK هست (دقیقاً مثل چیزی که تو ریپازیتوری گذاشتی).
+# ربات این فایل رو با ast.literal_eval می‌خونه (نه exec/eval)، پس حتی اگه فایل مخرب هم باشه
+# هیچ کدی اجرا نمی‌شه؛ فقط رشته/لیست/دیکشنری ساده ازش خونده می‌شه.
+DEFAULT_PACK_URL = os.environ.get("DEFAULT_PACK_URL", "")
+DEFAULT_PACK_REFRESH_SECONDS = 3600  # هر چند وقت یک‌بار خودکار از گیت‌هاب دوباره خونده بشه
+_default_pack_cache = {"data": {}, "loaded_at": None}
 
 # مراحل مکالمه (ConversationHandler states)
 (
@@ -155,6 +167,15 @@ def init_db():
             title TEXT,
             PRIMARY KEY (user_id, chat_id)
         );
+
+        CREATE TABLE IF NOT EXISTS group_members (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            first_name TEXT,
+            username TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (chat_id, user_id)
+        );
         """
     )
     conn.commit()
@@ -177,6 +198,7 @@ def init_db():
         "allow_video INTEGER NOT NULL DEFAULT 1",
         "allow_sticker_gif INTEGER NOT NULL DEFAULT 1",
         "owner_user_id INTEGER",
+        "use_default_pack INTEGER NOT NULL DEFAULT 0",
     ):
         _add_column_if_missing("group_settings", coldef)
 
@@ -569,6 +591,102 @@ def clear_tracked_messages(chat_id: int, message_ids):
     conn.close()
 
 
+# ---- ارسال پیام + ردیابی خودکار (تا «حذف پیام‌ها» پیام‌های خودِ ربات رو هم پاک کنه) ---
+async def send_tracked(bot, chat_id: int, text: str, **kwargs):
+    sent = await bot.send_message(chat_id, text, **kwargs)
+    track_message(chat_id, sent.message_id)
+    return sent
+
+
+async def reply_tracked(message, text: str, **kwargs):
+    sent = await message.reply_text(text, **kwargs)
+    track_message(message.chat_id, sent.message_id)
+    return sent
+
+
+# ---- اعضای شناخته‌شده‌ی هر گروه (برای قابلیت تگ همگانی) ---------------------
+def upsert_group_member(chat_id: int, user):
+    if user is None or user.is_bot:
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO group_members (chat_id, user_id, first_name, username, updated_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id, user_id) DO UPDATE SET first_name=excluded.first_name, "
+        "username=excluded.username, updated_at=excluded.updated_at",
+        (chat_id, user.id, user.first_name or "کاربر", user.username, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_group_members(chat_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, first_name, username FROM group_members WHERE chat_id=?", (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def remove_group_member(chat_id: int, user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM group_members WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+# ---- پک دیالوگ پیش‌فرض (از فایلی روی گیت‌هاب خونده می‌شه، نه هاردکد تو کد ربات) -----
+async def _fetch_url_text(url: str) -> str:
+    def _blocking():
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            return resp.read().decode("utf-8")
+    return await asyncio.to_thread(_blocking)
+
+
+async def get_default_pack(force_refresh: bool = False) -> dict:
+    """
+    پک پیش‌فرض رو از DEFAULT_PACK_URL می‌خونه و کش می‌کنه. فایل باید یه فایل پایتونی باشه که
+    یه دیکشنری به اسم DEFAULT_PACK داره (رشته -> لیست رشته). با ast.literal_eval خونده می‌شه،
+    یعنی هیچ کدی از اون فایل اجرا نمی‌شه - فقط داده‌ی ساده (امن در برابر کد مخرب).
+    """
+    if not DEFAULT_PACK_URL:
+        return {}
+    now = datetime.utcnow()
+    if not force_refresh and _default_pack_cache["loaded_at"] is not None:
+        age = (now - _default_pack_cache["loaded_at"]).total_seconds()
+        if age < DEFAULT_PACK_REFRESH_SECONDS:
+            return _default_pack_cache["data"]
+    try:
+        text = await _fetch_url_text(DEFAULT_PACK_URL)
+        tree = ast.parse(text, mode="exec")
+        pack = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "DEFAULT_PACK" for t in node.targets
+            ):
+                pack = ast.literal_eval(node.value)
+                break
+        if not isinstance(pack, dict):
+            raise ValueError("متغیر DEFAULT_PACK تو فایل پیدا نشد یا دیکشنری نیست.")
+        _default_pack_cache["data"] = pack
+        _default_pack_cache["loaded_at"] = now
+    except Exception as e:
+        logger.warning(f"خطا در گرفتن پک پیش‌فرض از گیت‌هاب: {e}")
+        # اگه قبلاً یه نسخه‌ی موفق کش شده باشه، همون برمی‌گرده؛ وگرنه دیکشنری خالی
+    return _default_pack_cache["data"]
+
+
+def find_in_default_pack(pack: dict, text: str):
+    if not pack:
+        return None
+    answers = pack.get(text.strip())
+    if answers:
+        return random.choice(answers)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # کیبوردها
 # ---------------------------------------------------------------------------
@@ -584,6 +702,7 @@ def admin_menu_keyboard():
             [InlineKeyboardButton("🗑 حذف پیام‌ها", callback_data="adm_delete_msgs")],
             [InlineKeyboardButton("🌟 افراد ویژه", callback_data="adm_special")],
             [InlineKeyboardButton("⚙️ تنظیمات گروه", callback_data="adm_settings")],
+            [InlineKeyboardButton("🗨 کلمه‌های آماده", callback_data="adm_ready_words")],
             [InlineKeyboardButton("👥 تعداد اعضا", callback_data="adm_member_count"),
              InlineKeyboardButton("🔗 لینک دعوت", callback_data="adm_invite_link")],
         ]
@@ -1050,18 +1169,18 @@ async def perform_warn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target,
     )
     text = f"⚠️ {target.first_name} شما {count} اخطار از {MAX_WARNINGS} اخطار رو گرفتید.\nدلیل: {reason}"
     if reply_target_message is not None:
-        await reply_target_message.reply_text(text, reply_markup=keyboard)
+        await reply_tracked(reply_target_message, text, reply_markup=keyboard)
     else:
-        await context.bot.send_message(chat_id, text, reply_markup=keyboard)
+        await send_tracked(context.bot, chat_id, text, reply_markup=keyboard)
     if count >= MAX_WARNINGS:
         try:
             await context.bot.ban_chat_member(chat_id, target.id)
-            await context.bot.send_message(
-                chat_id, f"🚫 {target.first_name} به دلیل رسیدن به {MAX_WARNINGS} اخطار از گروه حذف شد."
+            await send_tracked(
+                context.bot, chat_id, f"🚫 {target.first_name} به دلیل رسیدن به {MAX_WARNINGS} اخطار از گروه حذف شد."
             )
             remove_all_warnings(chat_id, target.id)
         except Exception as e:
-            await context.bot.send_message(chat_id, f"نتونستم کاربر رو حذف کنم: {e}")
+            await send_tracked(context.bot, chat_id, f"نتونستم کاربر رو حذف کنم: {e}")
 
 
 async def adm_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,6 +1592,61 @@ async def adm_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ---- کلمه‌های آماده (پک پیش‌فرض دیالوگ که از گیت‌هاب خونده می‌شه) ------------
+async def adm_ready_words_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    s = get_settings(chat_id)
+    status = "✅ فعال" if s["use_default_pack"] else "❌ غیرفعال"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"🗨 کلمه‌های پیش‌فرض: {status}", callback_data="toggle_default_pack")],
+            [InlineKeyboardButton("🔄 بروزرسانی پک از گیت‌هاب", callback_data="refresh_default_pack")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back")],
+        ]
+    )
+    await update.callback_query.edit_message_text("لحن خود را انتخاب کن:", reply_markup=keyboard)
+
+
+async def toggle_default_pack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    chat_id = update.effective_chat.id
+    if not DEFAULT_PACK_URL:
+        await update.callback_query.edit_message_text(
+            "این قابلیت هنوز آماده نیست: اول باید آدرس فایل پک پیش‌فرض (DEFAULT_PACK_URL) روی سرور ربات تنظیم بشه.",
+            reply_markup=back_to_admin_keyboard(),
+        )
+        return
+    s = get_settings(chat_id)
+    new_val = 0 if s["use_default_pack"] else 1
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE group_settings SET use_default_pack=? WHERE chat_id=?", (new_val, chat_id))
+    conn.commit()
+    conn.close()
+    if new_val:
+        await get_default_pack()  # کش رو گرم می‌کنیم
+    await adm_ready_words_menu(update, context)
+
+
+async def refresh_default_pack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _guard_admin_callback(update, context):
+        return
+    if not DEFAULT_PACK_URL:
+        await update.callback_query.edit_message_text(
+            "این قابلیت هنوز آماده نیست: اول باید آدرس فایل پک پیش‌فرض (DEFAULT_PACK_URL) روی سرور ربات تنظیم بشه.",
+            reply_markup=back_to_admin_keyboard(),
+        )
+        return
+    pack = await get_default_pack(force_refresh=True)
+    await update.callback_query.edit_message_text(
+        f"✅ بروزرسانی شد. الان {len(pack)} کلمه تو پک پیش‌فرضه.",
+        reply_markup=back_to_admin_keyboard(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # هندلر عمومی پیام‌های گروه: چک کلمات ممنوعه، جواب کلمات یاد گرفته شده، ردیابی پیام، فوروارد
 # ---------------------------------------------------------------------------
@@ -1488,12 +1662,54 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     # این کاربر رو به عنوان کسی که تو این گروه فعاله ثبت می‌کنیم (برای اینکه بشه تو پیوی هم روی این گروه کار کرد)
     record_user_group(user.id, chat_id, chat.title)
+    upsert_group_member(chat_id, user)  # برای قابلیت تگ همگانی
 
     # ردیابی آی‌دی پیام برای قابلیت حذف پیام‌ها
     track_message(chat_id, msg.message_id)
 
-    # ---- دستورهای سریع ادمین (فقط وقتی ریپلای روی پیام یه عضو باشه و فرستنده ادمین باشه) ----
     text_stripped = msg.text.strip()
+
+    # ---- دستورهای سریع بدون نیاز به ریپلای ----
+
+    # لینک گروه - فقط مالک - "لینک"
+    if text_stripped == "لینک" and await is_user_owner(context, chat_id, user.id):
+        try:
+            link = await context.bot.export_chat_invite_link(chat_id)
+            await reply_tracked(msg, f"🔗 لینک گروه:\n{link}")
+        except Exception as e:
+            await reply_tracked(msg, f"نتونستم لینک رو بگیرم: {e}")
+        return
+
+    # تگ همگانی - فقط مالک، باید ریپلای روی یه پیام باشه - "تگ همگانی"
+    if text_stripped == "تگ همگانی" and await is_user_owner(context, chat_id, user.id):
+        if not msg.reply_to_message:
+            await reply_tracked(msg, "برای تگ همگانی باید روی یه پیام ریپلای کنی.")
+            return
+        members = get_group_members(chat_id)
+        if not members:
+            await reply_tracked(
+                msg,
+                "هنوز هیچ عضوی رو نشناختم؛ اعضا باید حداقل یه پیام تو گروه بفرستن تا بشناسمشون.",
+            )
+            return
+        target_message_id = msg.reply_to_message.message_id
+        CHUNK = 8
+        for i in range(0, len(members), CHUNK):
+            chunk = members[i : i + CHUNK]
+            mentions = " ".join(
+                f'<a href="tg://user?id={m["user_id"]}">{html.escape(m["first_name"] or "کاربر")}</a>'
+                for m in chunk
+            )
+            try:
+                sent = await context.bot.send_message(
+                    chat_id, mentions, parse_mode=ParseMode.HTML, reply_to_message_id=target_message_id
+                )
+                track_message(chat_id, sent.message_id)
+            except Exception:
+                pass
+        return
+
+    # ---- دستورهای سریع ادمین (فقط وقتی ریپلای روی پیام یه عضو باشه و فرستنده ادمین باشه) ----
     if msg.reply_to_message and await is_user_admin(update, context, user.id, chat_id):
         target = msg.reply_to_message.from_user
 
@@ -1501,9 +1717,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if text_stripped in ("بن", "صیکتیر"):
             try:
                 await context.bot.ban_chat_member(chat_id, target.id)
-                await msg.reply_text(f"🚫 {target.first_name} از گروه حذف شد.")
+                await reply_tracked(msg, f"🚫 {target.first_name} از گروه حذف شد.")
             except Exception as e:
-                await msg.reply_text(f"نتونستم حذفش کنم: {e}")
+                await reply_tracked(msg, f"نتونستم حذفش کنم: {e}")
             return
 
         # اخطار سریع - "اخطار" یا "اخطار <دلیل>"
@@ -1524,27 +1740,51 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=int(until),
                 )
-                await msg.reply_text(f"🔇 {target.first_name} به مدت {minutes} دقیقه سکوت شد.")
+                await reply_tracked(msg, f"🔇 {target.first_name} به مدت {minutes} دقیقه سکوت شد.")
             except Exception as e:
-                await msg.reply_text(f"نتونستم سکوتش کنم: {e}")
+                await reply_tracked(msg, f"نتونستم سکوتش کنم: {e}")
+            return
+
+        # آزاد کردن از سکوت - "آزاد"
+        if text_stripped == "آزاد":
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id,
+                    target.id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True,
+                        can_send_audios=True,
+                        can_send_documents=True,
+                        can_send_photos=True,
+                        can_send_videos=True,
+                        can_send_video_notes=True,
+                        can_send_voice_notes=True,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                    ),
+                )
+                await reply_tracked(msg, f"🔊 {target.first_name} از سکوت در اومد.")
+            except Exception as e:
+                await reply_tracked(msg, f"نتونستم آزادش کنم: {e}")
             return
 
         # پین سریع - "پین"
         if text_stripped == "پین":
             try:
                 await context.bot.pin_chat_message(chat_id, msg.reply_to_message.message_id)
-                await msg.reply_text("📌 پیام پین شد.")
+                await reply_tracked(msg, "📌 پیام پین شد.")
             except Exception as e:
-                await msg.reply_text(f"نتونستم پینش کنم: {e}")
+                await reply_tracked(msg, f"نتونستم پینش کنم: {e}")
             return
 
         # آنپین سریع - "آنپین"
         if text_stripped == "آنپین":
             try:
                 await context.bot.unpin_chat_message(chat_id, msg.reply_to_message.message_id)
-                await msg.reply_text("📌 پین پیام برداشته شد.")
+                await reply_tracked(msg, "📌 پین پیام برداشته شد.")
             except Exception as e:
-                await msg.reply_text(f"نتونستم آنپینش کنم: {e}")
+                await reply_tracked(msg, f"نتونستم آنپینش کنم: {e}")
             return
 
     # تنظیم فوروارد: اگه فوروارد ممنوع باشه و پیام فوروارد شده باشه، حذفش کن
@@ -1552,7 +1792,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if msg.forward_origin is not None and not settings["forward_allowed"]:
         try:
             await msg.delete()
-            await context.bot.send_message(chat_id, f"فوروارد پیام در این گروه غیرفعاله، {user.first_name}.")
+            await send_tracked(context.bot, chat_id, f"فوروارد پیام در این گروه غیرفعاله، {user.first_name}.")
         except Exception:
             pass
         return
@@ -1574,7 +1814,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.restrict_chat_member(
                     chat_id, user.id, permissions=ChatPermissions(can_send_messages=False), until_date=int(until)
                 )
-                await context.bot.send_message(
+                await send_tracked(
+                    context.bot,
                     chat_id,
                     f"🔇 {user.first_name} به خاطر ارسال پشت‌سرهم پیام (اسپم)، {minutes} دقیقه سکوت شد.",
                 )
@@ -1598,7 +1839,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     [InlineKeyboardButton("✅ حذف اخطار", callback_data=f"warnremove_{user.id}")],
                 ]
             )
-            await context.bot.send_message(
+            await send_tracked(
+                context.bot,
                 chat_id,
                 f"{user.first_name} شما از کلمه ممنوعه استفاده کردید و {count} اخطار از {MAX_WARNINGS} اخطار رو گرفتید.",
                 reply_markup=keyboard,
@@ -1606,20 +1848,37 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             if count >= MAX_WARNINGS:
                 try:
                     await context.bot.ban_chat_member(chat_id, user.id)
-                    await context.bot.send_message(
-                        chat_id, f"🚫 {user.first_name} به دلیل رسیدن به {MAX_WARNINGS} اخطار حذف شد."
+                    await send_tracked(
+                        context.bot, chat_id, f"🚫 {user.first_name} به دلیل رسیدن به {MAX_WARNINGS} اخطار حذف شد."
                     )
                     remove_all_warnings(chat_id, user.id)
                 except Exception:
                     pass
             return
 
-    # جواب به کلمات یاد گرفته شده - فقط لیستِ مالکِ واقعیِ گروه اجرا می‌شه
+    # جواب به کلمات یاد گرفته شده - اول لیستِ مالکِ واقعیِ گروه، بعد (اگه فعال بود) پک پیش‌فرض
     owner_id = await get_group_owner_id(context, chat_id)
+    answer = None
     if owner_id:
         answer = find_matching_word(chat_id, owner_id, msg.text)
-        if answer:
-            await msg.reply_text(answer)
+    if not answer and settings["use_default_pack"]:
+        pack = await get_default_pack()
+        answer = find_in_default_pack(pack, msg.text)
+    if answer:
+        await reply_tracked(msg, answer)
+
+
+async def group_member_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """با ورود/خروج اعضا، لیست اعضای شناخته‌شده‌ی گروه (برای تگ همگانی) رو به‌روز نگه می‌داره."""
+    msg = update.message
+    if msg is None:
+        return
+    chat_id = update.effective_chat.id
+    if msg.new_chat_members:
+        for member in msg.new_chat_members:
+            upsert_group_member(chat_id, member)
+    if msg.left_chat_member:
+        remove_group_member(chat_id, msg.left_chat_member.id)
 
 
 async def group_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1632,6 +1891,7 @@ async def group_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     chat_id = chat.id
     user = update.effective_user
+    upsert_group_member(chat_id, user)  # برای قابلیت تگ همگانی
     settings = get_settings(chat_id)
     is_admin_user = await is_user_admin(update, context, user.id, chat_id)
 
@@ -1646,7 +1906,7 @@ async def group_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if blocked_reason:
         try:
             await msg.delete()
-            await context.bot.send_message(chat_id, f"{user.first_name} {blocked_reason} تو این گروه غیرفعاله.")
+            await send_tracked(context.bot, chat_id, f"{user.first_name} {blocked_reason} تو این گروه غیرفعاله.")
         except Exception:
             pass
         return
@@ -1735,6 +1995,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(adm_settings_menu, pattern="^adm_settings$"))
     app.add_handler(CallbackQueryHandler(adm_member_count, pattern="^adm_member_count$"))
     app.add_handler(CallbackQueryHandler(adm_invite_link, pattern="^adm_invite_link$"))
+    app.add_handler(CallbackQueryHandler(adm_ready_words_menu, pattern="^adm_ready_words$"))
+    app.add_handler(CallbackQueryHandler(toggle_default_pack, pattern="^toggle_default_pack$"))
+    app.add_handler(CallbackQueryHandler(refresh_default_pack, pattern="^refresh_default_pack$"))
     app.add_handler(CallbackQueryHandler(set_toggle_forward, pattern="^set_toggle_forward$"))
     app.add_handler(CallbackQueryHandler(set_toggle_photo, pattern="^set_toggle_photo$"))
     app.add_handler(CallbackQueryHandler(set_toggle_video, pattern="^set_toggle_video$"))
@@ -1844,6 +2107,14 @@ def build_application() -> Application:
         MessageHandler(
             (filters.PHOTO | filters.VIDEO | filters.Sticker.ALL | filters.ANIMATION) & filters.ChatType.GROUPS,
             group_media_handler,
+        )
+    )
+
+    # هندلر ورود/خروج اعضا (برای به‌روز نگه‌داشتن لیستِ تگ همگانی)
+    app.add_handler(
+        MessageHandler(
+            (filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER) & filters.ChatType.GROUPS,
+            group_member_update_handler,
         )
     )
 
