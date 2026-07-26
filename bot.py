@@ -66,8 +66,8 @@ if _env_super_admins:
 # اگه متغیرش خالی باشه یعنی هنوز فایلش آماده نیست. چندتا لحن می‌تونن هم‌زمان برای یه گروه فعال باشن.
 PACK_DEFINITIONS = {
     "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/default_pack.py"},
-    "angry": {"label": "😠 عصبانی", "url_env": "ANGRY_PACK_URL"},
-    "sad": {"label": "😢 ناراحت", "url_env": "SAD_PACK_URL"},
+    "angry": {"label": "😠 عصبانی", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/angry_pack.py"},
+    "sad": {"label": "😢 ناراحت", "url_env": ""},
     "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL"},
 }
 DEFAULT_PACK_REFRESH_SECONDS = 3600  # هر چند وقت یک‌بار خودکار از گیت‌هاب دوباره خونده بشه
