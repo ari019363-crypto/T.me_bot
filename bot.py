@@ -67,8 +67,8 @@ if _env_super_admins:
 PACK_DEFINITIONS = {
     "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/default_pack.py"},
     "angry": {"label": "😠 عصبانی", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/angry_pack.py"},
-    "sad": {"label": "😢 ناراحت", "url_env": ""},
-    "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL"},
+    "sad": {"label": "😢 ناراحت", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/sad_pack.py"},
+    "happy": {"label": "😄 خوشحال", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/happy_pack.py"},
 }
 DEFAULT_PACK_REFRESH_SECONDS = 3600  # هر چند وقت یک‌بار خودکار از گیت‌هاب دوباره خونده بشه
 _pack_cache = {}  # pack_name -> {"data": {...}, "loaded_at": datetime | None}
