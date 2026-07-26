@@ -47,7 +47,7 @@ logger = logging.getLogger("chatr_bot")
 # ---------------------------------------------------------------------------
 # تنظیمات پایه
 # ---------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAGBdIZYPBXCs-DZ_E1ZD3rGsSLOO0QQIvg")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatr_bot.db")
 MAX_WARNINGS = 3          # بعد از این تعداد اخطار، کاربر به صورت خودکار از گروه حذف می‌شه
 MESSAGES_TO_KEEP = 2000   # حداکثر تعداد آی‌دی پیام ذخیره شده برای هر گروه (برای قابلیت حذف پیام‌ها)
@@ -57,7 +57,7 @@ MAX_SPAM_MUTE_MINUTES = 30  # حداکثر مجاز برای دقیقه‌ی س�
 # فارغ از اینکه واقعا ادمین/مالک همون گروه باشه یا نه، دسترسی کامل ادمین و مالک داره.
 # می‌تونی مستقیم عدد آی‌دیت رو اینجا بنویسی، یا با متغیر محیطی SUPER_ADMIN_IDS (با کاما جدا) ست کنی.
 SUPER_ADMIN_IDS = set()
-_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "")
+_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "7430881772")
 if _env_super_admins:
     SUPER_ADMIN_IDS |= {int(x.strip()) for x in _env_super_admins.split(",") if x.strip().isdigit()}
 # مثال دستی: SUPER_ADMIN_IDS.add(123456789)
@@ -65,7 +65,7 @@ if _env_super_admins:
 # پک‌های دیالوگ (لحن‌ها) که از فایل‌های راو گیت‌هاب خونده می‌شن. هر لحن یه متغیر محیطی جدا داره؛
 # اگه متغیرش خالی باشه یعنی هنوز فایلش آماده نیست. چندتا لحن می‌تونن هم‌زمان برای یه گروه فعال باشن.
 PACK_DEFINITIONS = {
-    "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "DEFAULT_PACK_URL"},
+    "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/default_pack.py"},
     "angry": {"label": "😠 عصبانی", "url_env": "ANGRY_PACK_URL"},
     "sad": {"label": "😢 ناراحت", "url_env": "SAD_PACK_URL"},
     "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL"},
