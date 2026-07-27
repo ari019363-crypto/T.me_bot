@@ -11,11 +11,16 @@
 طراحی رابط کاربری: کل بازی روی یه پیامِ واحد انجام می‌شه (فقط ادیت می‌شه، نه پیام جدید)،
 پس گپ همیشه تمیز می‌مونه - نیازی به تایپ عدد و پاک کردن پیام نیست.
 
+قانون بازی: هر بازیکن حداکثر ۳ مهره رو زمین داره. وقتی مهره‌ی چهارم رو می‌ذاره، قدیمی‌ترین
+مهره‌ی خودش (به ترتیب زمانی) برداشته می‌شه. این یعنی هیچ‌وقت بیشتر از ۶ خونه (۳+۳) پر نمی‌شه،
+پس بازی هیچ‌وقت مساوی نمی‌شه - یا کسی می‌بره یا بازی ادامه داره.
+
 قابلیت‌ها:
-- "دوز" یا /dooz -> انتخاب حالت: بازی با ربات / بازی با کاربر
-- بازی با ربات: ۴ درجه سختی (آسون تا وحشتناک، آخری غیرقابل شکسته)
+- "دوز" یا /dooz -> انتخاب حالت: بازی با ربات / بازی با کاربر / پروفایل
+- بازی با ربات: ۴ درجه سختی (آسون تا وحشتناک)
 - بازی با کاربر: روی پیام طرف ریپلای بزن و بنویس «بازی»
-- بعد از باخت/برد/مساوی، دکمه‌ی «دوباره بازی» با جابه‌جاییِ نفرِ اول (منصفانه‌تر)
+- بعد از باخت/برد، دکمه‌های «دوباره بازی» (با جابه‌جاییِ نفرِ اول) و «بستن بازی»
+- آمار رودررو + پروفایل شخصی (جمع بازی/برد/باخت + لیست حریف‌ها)
 """
 
 import os
@@ -39,6 +44,7 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatr_bot.db")
 BOT_SENTINEL = -1  # آی‌دی قراردادی برای «ربات» به‌عنوان بازیکن (آی‌دی واقعی تلگرام هیچ‌وقت منفی نیست)
+MAX_MARKS_PER_PLAYER = 3  # هر بازیکن حداکثر همین تعداد مهره رو زمین داره
 
 WIN_LINES = (
     (0, 1, 2), (3, 4, 5), (6, 7, 8),
@@ -82,7 +88,9 @@ def _ensure_schema():
             board TEXT NOT NULL,
             turn TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
-            created_at TEXT
+            created_at TEXT,
+            x_queue TEXT NOT NULL DEFAULT '[]',
+            o_queue TEXT NOT NULL DEFAULT '[]'
         )
         """
     )
@@ -115,6 +123,15 @@ def _ensure_schema():
         """
     )
     conn.commit()
+
+    # مهاجرت امن: اگه از قبل جدول dooz_games بدون x_queue/o_queue وجود داشته باشه
+    c.execute("PRAGMA table_info(dooz_games)")
+    existing_cols = [r[1] for r in c.fetchall()]
+    for coldef in ("x_queue TEXT NOT NULL DEFAULT '[]'", "o_queue TEXT NOT NULL DEFAULT '[]'"):
+        col_name = coldef.split()[0]
+        if col_name not in existing_cols:
+            c.execute(f"ALTER TABLE dooz_games ADD COLUMN {coldef}")
+    conn.commit()
     conn.close()
 
 
@@ -129,8 +146,8 @@ def create_game(chat_id, player_x_id, player_x_name, player_o_id, player_o_name,
     c = conn.cursor()
     c.execute(
         "INSERT INTO dooz_games "
-        "(chat_id, player_x_id, player_x_name, player_o_id, player_o_name, vs_bot, difficulty, board, turn, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+        "(chat_id, player_x_id, player_x_name, player_o_id, player_o_name, vs_bot, difficulty, board, turn, status, created_at, x_queue, o_queue) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, '[]', '[]')",
         (
             chat_id, player_x_id, player_x_name, player_o_id, player_o_name,
             int(vs_bot), difficulty, json.dumps(board), turn, datetime.utcnow().isoformat(),
@@ -159,10 +176,13 @@ def set_message_id(game_id: int, message_id: int):
     conn.close()
 
 
-def update_game(game_id: int, board: list, turn: str):
+def update_game(game_id: int, board: list, turn: str, x_queue: list, o_queue: list):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE dooz_games SET board=?, turn=? WHERE game_id=?", (json.dumps(board), turn, game_id))
+    c.execute(
+        "UPDATE dooz_games SET board=?, turn=?, x_queue=?, o_queue=? WHERE game_id=?",
+        (json.dumps(board), turn, json.dumps(x_queue), json.dumps(o_queue), game_id),
+    )
     conn.commit()
     conn.close()
 
@@ -308,43 +328,88 @@ def finalize_game(game, board: list, winner: str) -> str:
 # منطق بازی
 # ---------------------------------------------------------------------------
 def check_winner(board: list):
-    """برگردوندن 'X'، 'O'، 'DRAW' یا None."""
+    """برگردوندن 'X'، 'O' یا None. (با قانون حداکثر ۳ مهره، بازی هیچ‌وقت مساوی/پر نمی‌شه.)"""
     for a, b, c_ in WIN_LINES:
         if board[a] and board[a] == board[b] == board[c_]:
             return board[a]
-    if all(cell for cell in board):
-        return "DRAW"
     return None
 
 
-def minimax(board: list, player: str, bot_mark: str, human_mark: str, depth: int = 0):
-    """مینی‌مکس کامل (بدون هرس) - برای دوز به این کوچیکی خیلی سریع اجرا می‌شه."""
+def apply_move(board: list, x_queue: list, o_queue: list, mark: str, idx: int):
+    """
+    یه حرکت رو اعمال می‌کنه: اگه بازیکن از قبل ۳ مهره رو زمین داشته باشه، قدیمی‌ترینش
+    (طبق ترتیب زمانیِ صف) برداشته می‌شه و بعد مهره‌ی جدید تو خونه‌ی انتخابی گذاشته می‌شه.
+    board / x_queue / o_queue همگی in-place تغییر می‌کنن.
+    """
+    queue = x_queue if mark == "X" else o_queue
+    if len(queue) >= MAX_MARKS_PER_PLAYER:
+        oldest = queue.pop(0)
+        board[oldest] = ""
+    queue.append(idx)
+    board[idx] = mark
+
+
+def _heuristic_score(board: list, bot_mark: str, human_mark: str) -> int:
+    """امتیازدهیِ تقریبی برای وقتی جستجو به عمقِ مجاز رسیده ولی بازی تموم نشده."""
+    score = 0
+    for a, b, c_ in WIN_LINES:
+        line = (board[a], board[b], board[c_])
+        bot_count = line.count(bot_mark)
+        human_count = line.count(human_mark)
+        if bot_count and not human_count:
+            score += 10 ** bot_count
+        elif human_count and not bot_count:
+            score -= 10 ** human_count
+    return score
+
+
+def minimax_limited(board, x_queue, o_queue, player, bot_mark, human_mark, depth, max_depth, alpha, beta):
+    """
+    مینی‌مکسِ عمق‌محدود با هرسِ آلفا-بتا. چون تو این نسخه از دوز (با قانون ۳ مهره) بازی
+    می‌تونه نظری تا بی‌نهایت ادامه پیدا کنه (مهره‌ها می‌چرخن)، برخلاف دوزِ کلاسیک نمی‌شه یه
+    مینی‌مکسِ کامل و بدون عمق زد؛ به‌جاش یه جستجوی عمیقِ کافی + هیوریستیک خوب داریم که در عمل
+    حریف رو خیلی سخت می‌کنه.
+    """
     winner = check_winner(board)
     if winner == bot_mark:
-        return 10 - depth, None
+        return 1000 - depth, None
     if winner == human_mark:
-        return depth - 10, None
-    if winner == "DRAW":
-        return 0, None
+        return depth - 1000, None
+    if depth >= max_depth:
+        return _heuristic_score(board, bot_mark, human_mark), None
 
-    best_score = float("-inf") if player == bot_mark else float("inf")
+    empty = [i for i, v in enumerate(board) if v == ""]
     best_move = None
-    for i in range(9):
-        if board[i] == "":
-            board[i] = player
-            score, _ = minimax(board, human_mark if player == bot_mark else bot_mark, bot_mark, human_mark, depth + 1)
-            board[i] = ""
-            if player == bot_mark and score > best_score:
+    if player == bot_mark:
+        best_score = float("-inf")
+        for i in empty:
+            b2, xq2, oq2 = board[:], x_queue[:], o_queue[:]
+            apply_move(b2, xq2, oq2, player, i)
+            score, _ = minimax_limited(b2, xq2, oq2, human_mark, bot_mark, human_mark, depth + 1, max_depth, alpha, beta)
+            if score > best_score:
                 best_score, best_move = score, i
-            elif player != bot_mark and score < best_score:
+            alpha = max(alpha, best_score)
+            if alpha >= beta:
+                break
+        return best_score, best_move
+    else:
+        best_score = float("inf")
+        for i in empty:
+            b2, xq2, oq2 = board[:], x_queue[:], o_queue[:]
+            apply_move(b2, xq2, oq2, player, i)
+            score, _ = minimax_limited(b2, xq2, oq2, bot_mark, bot_mark, human_mark, depth + 1, max_depth, alpha, beta)
+            if score < best_score:
                 best_score, best_move = score, i
-    return best_score, best_move
+            beta = min(beta, best_score)
+            if alpha >= beta:
+                break
+        return best_score, best_move
 
 
-def bot_move(board: list, difficulty: str, bot_mark: str, human_mark: str):
+def bot_move(board: list, x_queue: list, o_queue: list, difficulty: str, bot_mark: str, human_mark: str):
     empty = [i for i, v in enumerate(board) if v == ""]
     if not empty:
-        return None
+        return None  # عملاً هیچ‌وقت پیش نمیاد چون همیشه حداقل ۳ خونه خالیه
 
     if difficulty == "easy":
         return random.choice(empty)
@@ -352,18 +417,16 @@ def bot_move(board: list, difficulty: str, bot_mark: str, human_mark: str):
     if difficulty == "normal":
         # اگه یه حرکت برای بردن هست، بزن
         for i in empty:
-            board[i] = bot_mark
-            if check_winner(board) == bot_mark:
-                board[i] = ""
+            b2, xq2, oq2 = board[:], x_queue[:], o_queue[:]
+            apply_move(b2, xq2, oq2, bot_mark, i)
+            if check_winner(b2) == bot_mark:
                 return i
-            board[i] = ""
         # اگه حریف داره می‌بره، جلوشو بگیر
         for i in empty:
-            board[i] = human_mark
-            if check_winner(board) == human_mark:
-                board[i] = ""
+            b2, xq2, oq2 = board[:], x_queue[:], o_queue[:]
+            apply_move(b2, xq2, oq2, human_mark, i)
+            if check_winner(b2) == human_mark:
                 return i
-            board[i] = ""
         # وگرنه اولویت با وسط، بعد گوشه‌ها، بعد رندوم
         for pref in (4, 0, 2, 6, 8):
             if pref in empty:
@@ -371,14 +434,14 @@ def bot_move(board: list, difficulty: str, bot_mark: str, human_mark: str):
         return random.choice(empty)
 
     if difficulty == "hard":
-        # ۲۵٪ مواقع یه حرکت غیربهینه می‌زنه تا قابل‌شکست باشه، ولی بازم قویه
-        if random.random() < 0.25:
+        # ۱۵٪ مواقع یه حرکت غیربهینه می‌زنه تا قابل‌شکست باشه، ولی بازم قویه
+        if random.random() < 0.15:
             return random.choice(empty)
-        _, move = minimax(board[:], bot_mark, bot_mark, human_mark)
+        _, move = minimax_limited(board[:], x_queue[:], o_queue[:], bot_mark, bot_mark, human_mark, 0, 3, float("-inf"), float("inf"))
         return move if move is not None else random.choice(empty)
 
-    # impossible: همیشه بهینه، حداکثر نتیجه‌ی حریف مساویه
-    _, move = minimax(board[:], bot_mark, bot_mark, human_mark)
+    # impossible: جستجوی عمیق‌تر، بدون شانس تصادفی - در عمل تقریباً غیرقابل‌شکسته
+    _, move = minimax_limited(board[:], x_queue[:], o_queue[:], bot_mark, bot_mark, human_mark, 0, 6, float("-inf"), float("inf"))
     return move if move is not None else random.choice(empty)
 
 
@@ -528,6 +591,8 @@ async def dooz_move_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     board = json.loads(game["board"])
+    x_queue = json.loads(game["x_queue"])
+    o_queue = json.loads(game["o_queue"])
     user = update.effective_user
     current_mark = game["turn"]
     current_player_id = game["player_x_id"] if current_mark == "X" else game["player_o_id"]
@@ -540,7 +605,7 @@ async def dooz_move_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     await query.answer()
-    board[idx] = current_mark
+    apply_move(board, x_queue, o_queue, current_mark, idx)
     winner = check_winner(board)
     if winner:
         stats_text = finalize_game(game, board, winner)
@@ -549,20 +614,20 @@ async def dooz_move_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     next_mark = "O" if current_mark == "X" else "X"
-    update_game(game_id, board, next_mark)
+    update_game(game_id, board, next_mark, x_queue, o_queue)
 
     # اگه بازی با رباته و نوبت به ربات (O) رسید، همین‌جا حرکتشو می‌زنه - بدون معطلی
     if game["vs_bot"] and next_mark == "O":
-        move_idx = bot_move(board[:], game["difficulty"], bot_mark="O", human_mark="X")
+        move_idx = bot_move(board[:], x_queue[:], o_queue[:], game["difficulty"], bot_mark="O", human_mark="X")
         if move_idx is not None:
-            board[move_idx] = "O"
+            apply_move(board, x_queue, o_queue, "O", move_idx)
         winner2 = check_winner(board)
         if winner2:
             stats_text = finalize_game(game, board, winner2)
             text, keyboard = build_game_view(game_id, board_override=board, winner=winner2)
             await query.edit_message_text(text + stats_text, reply_markup=keyboard)
             return
-        update_game(game_id, board, "X")
+        update_game(game_id, board, "X", x_queue, o_queue)
 
     text, keyboard = build_game_view(game_id, board_override=board)
     await query.edit_message_text(text, reply_markup=keyboard)
