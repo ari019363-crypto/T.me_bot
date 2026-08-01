@@ -76,7 +76,7 @@ MAX_SPAM_MUTE_MINUTES = 30  # حداکثر مجاز برای دقیقه‌ی س�
 # فارغ از اینکه واقعا ادمین/مالک همون گروه باشه یا نه، دسترسی کامل ادمین و مالک داره.
 # می‌تونی مستقیم عدد آی‌دیت رو اینجا بنویسی، یا با متغیر محیطی SUPER_ADMIN_IDS (با کاما جدا) ست کنی.
 SUPER_ADMIN_IDS = set()
-_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "7430881772")
+_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "7430881772,8632617239")
 if _env_super_admins:
     SUPER_ADMIN_IDS |= {int(x.strip()) for x in _env_super_admins.split(",") if x.strip().isdigit()}
 # مثال دستی: SUPER_ADMIN_IDS.add(123456789)
