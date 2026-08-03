@@ -68,7 +68,7 @@ logger = logging.getLogger("chatr_bot")
 # ---------------------------------------------------------------------------
 # تنظیمات پایه
 # ---------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8793539029:AAGBdIZYPBXCs-DZ_E1ZD3rGsSLOO0QQIvg")
 DB_PATH = os.environ.get("CHATR_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatr_bot.db"))
 MAX_WARNINGS = 3          # بعد از این تعداد اخطار، کاربر به صورت خودکار از گروه حذف می‌شه
 MESSAGES_TO_KEEP = 2000   # حداکثر تعداد آی‌دی پیام ذخیره شده برای هر گروه (برای قابلیت حذف پیام‌ها)
@@ -78,7 +78,7 @@ MAX_SPAM_MUTE_MINUTES = 30  # حداکثر مجاز برای دقیقه‌ی س�
 # فارغ از اینکه واقعا ادمین/مالک همون گروه باشه یا نه، دسترسی کامل ادمین و مالک داره.
 # می‌تونی مستقیم عدد آی‌دیت رو اینجا بنویسی، یا با متغیر محیطی SUPER_ADMIN_IDS (با کاما جدا) ست کنی.
 SUPER_ADMIN_IDS = set()
-_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "")
+_env_super_admins = os.environ.get("SUPER_ADMIN_IDS", "7430881772,8632617239")
 if _env_super_admins:
     SUPER_ADMIN_IDS |= {int(x.strip()) for x in _env_super_admins.split(",") if x.strip().isdigit()}
 # مثال دستی: SUPER_ADMIN_IDS.add(123456789)
@@ -88,10 +88,10 @@ if _env_super_admins:
 # پک‌های دیالوگ (لحن‌ها). برای هرکدوم لینک raw فایلش رو همین‌جا جلوی "url" بذار (بین "" خالی).
 # اگه ترجیح می‌دی به‌جاش با متغیر محیطی کار کنی، همون هم پشتیبانی می‌شه (اگه env ست شده باشه اون اولویت داره).
 PACK_DEFINITIONS = {
-    "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "DEFAULT_PACK_URL", "url": ""},
-    "angry": {"label": "😠 عصبانی", "url_env": "ANGRY_PACK_URL", "url": ""},
-    "sad": {"label": "😢 ناراحت", "url_env": "SAD_PACK_URL", "url": ""},
-    "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL", "url": ""},
+    "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "DEFAULT_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/default_pack.py"},
+    "angry": {"label": "😠 عصبانی", "url_env": "ANGRY_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/angry_pack.py"},
+    "sad": {"label": "😢 ناراحت", "url_env": "SAD_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/sad_pack.py"},
+    "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/happy_pack.py"},
 }
 
 
