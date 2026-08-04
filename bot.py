@@ -89,10 +89,10 @@ if _env_super_admins:
 # پک‌های دیالوگ (لحن‌ها). برای هرکدوم لینک raw فایلش رو همین‌جا جلوی "url" بذار (بین "" خالی).
 # اگه ترجیح می‌دی به‌جاش با متغیر محیطی کار کنی، همون هم پشتیبانی می‌شه (اگه env ست شده باشه اون اولویت داره).
 PACK_DEFINITIONS = {
-    "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "DEFAULT_PACK_URL", "url": ""},
-    "angry": {"label": "😠 عصبانی", "url_env": "ANGRY_PACK_URL", "url": ""},
-    "sad": {"label": "😢 ناراحت", "url_env": "SAD_PACK_URL", "url": ""},
-    "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL", "url": ""},
+    "default": {"label": "🗨 عمومی (پیش‌فرض)", "url_env": "DEFAULT_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/default_pack.py"},
+    "angry": {"label": "😠 عصبانی", "url_env": "ANGRY_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/angry_pack.py"},
+    "sad": {"label": "😢 ناراحت", "url_env": "SAD_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/sad_pack.py"},
+    "happy": {"label": "😄 خوشحال", "url_env": "HAPPY_PACK_URL", "url": "https://raw.githubusercontent.com/ari019363-crypto/T.me_bot/refs/heads/main/happy_pack.py"},
 }
 
 
